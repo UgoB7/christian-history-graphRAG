@@ -9,7 +9,12 @@ from christian_history_graphrag.config import load_settings
 from christian_history_graphrag.ingest import build_records, persist_records
 from christian_history_graphrag.kg_builder import run_kg_builder_enrichment
 from christian_history_graphrag.neo4j_store import Neo4jStore
-from christian_history_graphrag.rag import ask_hybrid_question, ask_question, embed_passages
+from christian_history_graphrag.rag import (
+    ask_hybrid_question,
+    ask_llm_only,
+    ask_question,
+    embed_passages,
+)
 
 app = typer.Typer(help="Christian history GraphRAG starter.")
 
@@ -166,6 +171,11 @@ def ask_hybrid(
     top_k: int = typer.Option(5, help="How many KG chunks to retrieve."),
     year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
     year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    compare_llm_only: bool = typer.Option(
+        False,
+        "--compare-llm-only",
+        help="Also show an answer from the same LLM without any GraphRAG context.",
+    ),
     show_context: bool = typer.Option(
         False, "--show-context", help="Display the retrieved graph context and sources."
     ),
@@ -187,7 +197,11 @@ def ask_hybrid(
             year_to=year_to,
             return_context=show_context,
         )
+        typer.echo("=== Hybrid GraphRAG Answer ===")
         typer.echo(result.answer)
+        if compare_llm_only:
+            typer.echo("\n=== LLM Only Answer ===")
+            typer.echo(ask_llm_only(settings=settings, question=question))
         if show_context and result.retriever_result:
             typer.echo("\n=== Context Used ===")
             for index, item in enumerate(result.retriever_result.items, start=1):

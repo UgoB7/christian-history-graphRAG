@@ -139,18 +139,22 @@ async def enrich_entities_with_kg_builder(
         if replace_existing:
             store.delete_kg_subgraph_for_entity(entity["wikidata_id"])
 
+        document_metadata = {
+            "wikidata_id": str(entity["wikidata_id"]),
+            "entity_name": str(entity["name"]),
+            "wikipedia_title": str(entity["wikipedia_title"]),
+            "wikipedia_url": str(entity["wikipedia_url"]),
+            "source": "wikipedia_kg_builder",
+        }
+        if entity.get("time_start_year") is not None:
+            document_metadata["time_start_year"] = str(entity["time_start_year"])
+        if entity.get("time_end_year") is not None:
+            document_metadata["time_end_year"] = str(entity["time_end_year"])
+
         await pipeline.run_async(
             file_path=entity["wikipedia_url"],
             text=article_text,
-            document_metadata={
-                "wikidata_id": entity["wikidata_id"],
-                "entity_name": entity["name"],
-                "wikipedia_title": entity["wikipedia_title"],
-                "wikipedia_url": entity["wikipedia_url"],
-                "time_start_year": entity["time_start_year"],
-                "time_end_year": entity["time_end_year"],
-                "source": "wikipedia_kg_builder",
-            },
+            document_metadata=document_metadata,
         )
         store.link_entity_to_kg_document(
             wikidata_id=entity["wikidata_id"],

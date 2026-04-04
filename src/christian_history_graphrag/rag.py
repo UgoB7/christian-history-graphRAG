@@ -135,6 +135,20 @@ def build_rag_response(
         },
         return_context=return_context,
     )
+
+
+def ask_llm_only(settings: Settings, question: str) -> str:
+    llm = build_llm(settings)
+    response = llm.invoke(
+        input=(
+            "Answer the question using only your own model knowledge. "
+            "Do not assume any retrieved graph context or external retrieved documents.\n\n"
+            f"Question: {question}"
+        )
+    )
+    return response.content
+
+
 def embed_passages(store: Neo4jStore, settings: Settings, rebuild: bool = False) -> None:
     embedder = build_embedder(settings)
     if rebuild:
