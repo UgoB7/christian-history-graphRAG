@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "christian-history-graphrag"
+version = "0.1.0"
+description = "GraphRAG starter for Christian history using Neo4j, Wikidata, and Wikipedia."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4>=4.12.0",
+  "neo4j>=5.18.0",
+  "neo4j-graphrag[sentence-transformers]",
+  "ollama>=0.4.0",
+  "python-dotenv>=1.0.0",
+  "requests>=2.31.0",
+  "typer>=0.12.0",
+]
+
+[project.scripts]
+christian-history-graphrag = "christian_history_graphrag.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
