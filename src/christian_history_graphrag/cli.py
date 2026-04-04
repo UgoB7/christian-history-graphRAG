@@ -7,8 +7,9 @@ import typer
 
 from christian_history_graphrag.config import load_settings
 from christian_history_graphrag.ingest import build_records, persist_records
+from christian_history_graphrag.kg_builder import run_kg_builder_enrichment
 from christian_history_graphrag.neo4j_store import Neo4jStore
-from christian_history_graphrag.rag import ask_question, embed_passages
+from christian_history_graphrag.rag import ask_hybrid_question, ask_question, embed_passages
 
 app = typer.Typer(help="Christian history GraphRAG starter.")
 
@@ -84,6 +85,44 @@ def reset_db() -> None:
         store.close()
 
 
+@app.command("kg-enrich")
+def kg_enrich(
+    qid: Optional[list[str]] = typer.Option(
+        None,
+        "--qid",
+        help="Restrict KG Builder enrichment to existing Entity wikidata IDs.",
+    ),
+    limit: int = typer.Option(25, help="Maximum number of entities to enrich."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    replace_existing: bool = typer.Option(
+        True,
+        "--replace-existing/--keep-existing",
+        help="Delete the previous KG Builder subgraph for each entity before rebuilding.",
+    ),
+) -> None:
+    settings = load_settings()
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        enriched = run_kg_builder_enrichment(
+            store=store,
+            settings=settings,
+            qids=qid or None,
+            limit=limit,
+            year_from=year_from,
+            year_to=year_to,
+            replace_existing=replace_existing,
+        )
+        typer.echo(f"KG Builder enriched {enriched} entities.")
+    finally:
+        store.close()
+
+
 @app.command()
 def ask(
     question: str = typer.Argument(..., help="Question to ask over the graph."),
@@ -103,6 +142,43 @@ def ask(
     )
     try:
         result = ask_question(
+            store=store,
+            settings=settings,
+            question=question,
+            top_k=top_k,
+            year_from=year_from,
+            year_to=year_to,
+            return_context=show_context,
+        )
+        typer.echo(result.answer)
+        if show_context and result.retriever_result:
+            typer.echo("\n=== Context Used ===")
+            for index, item in enumerate(result.retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
+    finally:
+        store.close()
+
+
+@app.command("ask-hybrid")
+def ask_hybrid(
+    question: str = typer.Argument(..., help="Question to ask over the hybrid graph."),
+    top_k: int = typer.Option(5, help="How many KG chunks to retrieve."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    show_context: bool = typer.Option(
+        False, "--show-context", help="Display the retrieved graph context and sources."
+    ),
+) -> None:
+    settings = load_settings()
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        result = ask_hybrid_question(
             store=store,
             settings=settings,
             question=question,

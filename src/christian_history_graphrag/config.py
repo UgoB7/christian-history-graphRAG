@@ -31,6 +31,10 @@ class Settings:
     wikipedia_max_paragraphs: int
     passage_chunk_size: int
     passage_paragraph_overlap: int
+    kg_builder_max_paragraphs: int
+    kg_builder_chunk_size: int
+    kg_builder_chunk_overlap: int
+    kg_builder_schema_mode: str
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -81,4 +85,8 @@ def load_settings() -> Settings:
         wikipedia_max_paragraphs=_get_int("WIKIPEDIA_MAX_PARAGRAPHS", 18),
         passage_chunk_size=_get_int("PASSAGE_CHUNK_SIZE", 1400),
         passage_paragraph_overlap=_get_int("PASSAGE_PARAGRAPH_OVERLAP", 1),
+        kg_builder_max_paragraphs=_get_int("KG_BUILDER_MAX_PARAGRAPHS", 40),
+        kg_builder_chunk_size=_get_int("KG_BUILDER_CHUNK_SIZE", 1800),
+        kg_builder_chunk_overlap=_get_int("KG_BUILDER_CHUNK_OVERLAP", 150),
+        kg_builder_schema_mode=os.getenv("KG_BUILDER_SCHEMA_MODE", "GUIDED"),
     )

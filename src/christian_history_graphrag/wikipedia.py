@@ -67,6 +67,24 @@ class WikipediaClient:
             )
         return passages
 
+    def fetch_article_text(self, page_title: str, max_paragraphs: int = 40) -> str:
+        response = self.session.get(
+            self.api_url,
+            params={
+                "action": "parse",
+                "page": page_title,
+                "prop": "text",
+                "format": "json",
+                "formatversion": "2",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        html = payload["parse"]["text"]
+        paragraphs = self._html_to_paragraphs(html, max_paragraphs=max_paragraphs)
+        return "\n\n".join(paragraphs)
+
     def _html_to_paragraphs(self, html: str, max_paragraphs: int) -> list[str]:
         soup = BeautifulSoup(html, "html.parser")
         paragraphs = []

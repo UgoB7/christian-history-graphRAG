@@ -27,6 +27,15 @@ class Neo4jStore:
         for statement in statements:
             self.driver.execute_query(statement, database_=self.database)
 
+    def ensure_kg_indexes(self) -> None:
+        statements = [
+            "CREATE CONSTRAINT kg_document_path IF NOT EXISTS FOR (n:KgDocument) REQUIRE n.path IS UNIQUE",
+            "CREATE INDEX kg_document_wikidata IF NOT EXISTS FOR (n:KgDocument) ON (n.wikidata_id)",
+            "CREATE INDEX kg_chunk_index IF NOT EXISTS FOR (n:KgChunk) ON (n.index)",
+        ]
+        for statement in statements:
+            self.driver.execute_query(statement, database_=self.database)
+
     def upsert_entities(self, records: Iterable[EntityRecord]) -> None:
         for record in records:
             self.driver.execute_query(
@@ -137,9 +146,33 @@ class Neo4jStore:
             neo4j_database=self.database,
         )
 
+    def create_kg_chunk_vector_index(self) -> None:
+        result = self.driver.execute_query(
+            """
+            MATCH (c:KgChunk)
+            WHERE c.embedding IS NOT NULL
+            RETURN size(c.embedding) AS dimensions
+            LIMIT 1
+            """,
+            database_=self.database,
+        )
+        if not result.records:
+            return
+        dimensions = result.records[0]["dimensions"]
+        create_vector_index(
+            self.driver,
+            "kg_chunk_embeddings",
+            label="KgChunk",
+            embedding_property="embedding",
+            dimensions=dimensions,
+            similarity_fn="cosine",
+            neo4j_database=self.database,
+        )
+
     def reset_database(self) -> None:
         statements = [
             "DROP INDEX passage_embeddings IF EXISTS",
+            "DROP INDEX kg_chunk_embeddings IF EXISTS",
             "MATCH (n) DETACH DELETE n",
         ]
         for statement in statements:
@@ -151,12 +184,99 @@ class Neo4jStore:
             database_=self.database,
         )
 
+    def drop_kg_chunk_vector_index(self) -> None:
+        self.driver.execute_query(
+            "DROP INDEX kg_chunk_embeddings IF EXISTS",
+            database_=self.database,
+        )
+
     def clear_embeddings(self) -> None:
         self.driver.execute_query(
             """
             MATCH (p:Passage)
             REMOVE p.embedding
             """,
+            database_=self.database,
+        )
+
+    def clear_kg_embeddings(self) -> None:
+        self.driver.execute_query(
+            """
+            MATCH (c:KgChunk)
+            REMOVE c.embedding
+            """,
+            database_=self.database,
+        )
+
+    def list_entities_for_kg_enrichment(
+        self,
+        qids: Optional[list[str]] = None,
+        limit: int = 25,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+    ) -> list[dict]:
+        result = self.driver.execute_query(
+            """
+            MATCH (e:Entity)
+            WHERE e.wikipedia_title IS NOT NULL
+              AND ($qids IS NULL OR e.wikidata_id IN $qids)
+              AND ($year_from IS NULL OR coalesce(e.time_end_year, e.time_start_year, 999999) >= $year_from)
+              AND ($year_to IS NULL OR coalesce(e.time_start_year, e.time_end_year, -999999) <= $year_to)
+            RETURN e.wikidata_id AS wikidata_id,
+                   e.name AS name,
+                   e.wikipedia_title AS wikipedia_title,
+                   e.wikipedia_url AS wikipedia_url,
+                   e.time_start_year AS time_start_year,
+                   e.time_end_year AS time_end_year
+            ORDER BY e.name
+            LIMIT $limit
+            """,
+            {
+                "qids": qids or None,
+                "limit": limit,
+                "year_from": year_from,
+                "year_to": year_to,
+            },
+            database_=self.database,
+        )
+        return [record.data() for record in result.records]
+
+    def delete_kg_subgraph_for_entity(self, wikidata_id: str) -> None:
+        self.driver.execute_query(
+            """
+            MATCH (d:KgDocument {wikidata_id: $wikidata_id})
+            OPTIONAL MATCH (c:KgChunk)-[:KG_FROM_DOCUMENT]->(d)
+            WITH collect(DISTINCT c) AS chunks, collect(DISTINCT d) AS docs
+            FOREACH (chunk IN chunks | DETACH DELETE chunk)
+            FOREACH (doc IN docs | DETACH DELETE doc)
+            """,
+            {"wikidata_id": wikidata_id},
+            database_=self.database,
+        )
+        self.driver.execute_query(
+            """
+            MATCH (n)
+            WHERE NOT n:Entity
+              AND NOT n:Passage
+              AND NOT n:KgDocument
+              AND NOT n:KgChunk
+              AND NOT (n)--()
+            DELETE n
+            """,
+            database_=self.database,
+        )
+
+    def link_entity_to_kg_document(self, wikidata_id: str, wikipedia_url: str) -> None:
+        self.driver.execute_query(
+            """
+            MATCH (e:Entity {wikidata_id: $wikidata_id})
+            MATCH (d:KgDocument {path: $wikipedia_url})
+            MERGE (e)-[:HAS_KG_DOCUMENT]->(d)
+            """,
+            {
+                "wikidata_id": wikidata_id,
+                "wikipedia_url": wikipedia_url,
+            },
             database_=self.database,
         )
 

@@ -19,7 +19,7 @@ OPTIONAL MATCH (entity)-[r]-(neighbor:Entity)
 WHERE ($year_from IS NULL OR coalesce(entity.time_end_year, entity.time_start_year, 999999) >= $year_from)
   AND ($year_to IS NULL OR coalesce(entity.time_start_year, entity.time_end_year, -999999) <= $year_to)
 RETURN
-  node.id AS passage_id,
+  coalesce(node.id, elementId(node)) AS passage_id,
   node.text AS passage,
   node.title AS page_title,
   node.chunk_index AS chunk_index,
@@ -34,6 +34,34 @@ RETURN
     target: neighbor.name,
     target_qid: neighbor.wikidata_id
   })[0..12] AS graph_neighbors,
+  score
+"""
+
+HYBRID_RETRIEVAL_QUERY = """
+OPTIONAL MATCH (node)-[:KG_FROM_DOCUMENT]->(doc:KgDocument)
+OPTIONAL MATCH (entity:Entity)-[:HAS_KG_DOCUMENT]->(doc)
+OPTIONAL MATCH (kg_node)-[:KG_FROM_CHUNK]->(node)
+OPTIONAL MATCH (kg_node)-[r]-(neighbor)
+WHERE ($year_from IS NULL OR coalesce(entity.time_end_year, entity.time_start_year, 999999) >= $year_from)
+  AND ($year_to IS NULL OR coalesce(entity.time_start_year, entity.time_end_year, -999999) <= $year_to)
+  AND (r IS NULL OR type(r) <> 'KG_FROM_CHUNK')
+  AND (neighbor IS NULL OR (NOT neighbor:KgChunk AND NOT neighbor:KgDocument))
+RETURN
+  coalesce(node.id, elementId(node)) AS passage_id,
+  node.text AS passage,
+  doc.wikipedia_title AS page_title,
+  node.index AS chunk_index,
+  entity.name AS entity_name,
+  entity.wikidata_id AS entity_qid,
+  entity.entity_kind AS entity_kind,
+  entity.time_start_year AS start_year,
+  entity.time_end_year AS end_year,
+  doc.wikipedia_url AS wikipedia_url,
+  collect(DISTINCT {
+    node: kg_node.name,
+    relation: type(r),
+    target: neighbor.name
+  })[0..20] AS graph_neighbors,
   score
 """
 
@@ -70,6 +98,42 @@ def format_retrieval_record(record) -> RetrieverResultItem:
     return RetrieverResultItem(
         content="\n".join(str(part) for part in content_parts if part is not None),
         metadata=data,
+    )
+
+
+def build_rag_response(
+    store: Neo4jStore,
+    settings: Settings,
+    question: str,
+    top_k: int,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    return_context: bool,
+    index_name: str,
+    retrieval_query: str,
+) -> RagResultModel:
+    query_params = {}
+    if year_from is not None:
+        query_params["year_from"] = year_from
+    if year_to is not None:
+        query_params["year_to"] = year_to
+
+    retriever = VectorCypherRetriever(
+        store.driver,
+        index_name=index_name,
+        retrieval_query=retrieval_query,
+        embedder=build_embedder(settings),
+        result_formatter=format_retrieval_record,
+        neo4j_database=store.database,
+    )
+    rag = GraphRAG(retriever=retriever, llm=build_llm(settings))
+    return rag.search(
+        query_text=question,
+        retriever_config={
+            "top_k": top_k,
+            "query_params": query_params or None,
+        },
+        return_context=return_context,
     )
 def embed_passages(store: Neo4jStore, settings: Settings, rebuild: bool = False) -> None:
     embedder = build_embedder(settings)
@@ -118,27 +182,36 @@ def ask_question(
     year_to: Optional[int] = None,
     return_context: bool = False,
 ) -> RagResultModel:
-    query_params = {}
-    if year_from is not None:
-        query_params["year_from"] = year_from
-    if year_to is not None:
-        query_params["year_to"] = year_to
-
-    retriever = VectorCypherRetriever(
-        store.driver,
+    return build_rag_response(
+        store=store,
+        settings=settings,
+        question=question,
+        top_k=top_k,
+        year_from=year_from,
+        year_to=year_to,
+        return_context=return_context,
         index_name="passage_embeddings",
         retrieval_query=RETRIEVAL_QUERY,
-        embedder=build_embedder(settings),
-        result_formatter=format_retrieval_record,
-        neo4j_database=store.database,
     )
-    rag = GraphRAG(retriever=retriever, llm=build_llm(settings))
-    response = rag.search(
-        query_text=question,
-        retriever_config={
-            "top_k": top_k,
-            "query_params": query_params or None,
-        },
+
+
+def ask_hybrid_question(
+    store: Neo4jStore,
+    settings: Settings,
+    question: str,
+    top_k: int = 5,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    return_context: bool = False,
+) -> RagResultModel:
+    return build_rag_response(
+        store=store,
+        settings=settings,
+        question=question,
+        top_k=top_k,
+        year_from=year_from,
+        year_to=year_to,
         return_context=return_context,
+        index_name="kg_chunk_embeddings",
+        retrieval_query=HYBRID_RETRIEVAL_QUERY,
     )
-    return response
