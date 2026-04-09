@@ -6,7 +6,11 @@ from typing import Optional
 import typer
 
 from christian_history_graphrag.config import load_settings
-from christian_history_graphrag.ingest import build_records, persist_records
+from christian_history_graphrag.ingest import (
+    build_records,
+    persist_records,
+    populate_wikipedia_passages,
+)
 from christian_history_graphrag.kg_builder import run_kg_builder_enrichment
 from christian_history_graphrag.neo4j_store import Neo4jStore
 from christian_history_graphrag.rag import (
@@ -42,13 +46,45 @@ def ingest(
     try:
         if reset_db:
             store.reset_database()
+        typer.echo("Step 1/3: Fetching Wikidata graph...")
         records = build_records(
             seed_qids=seed_qid,
             settings=settings,
             max_depth=depth,
-            fetch_wikipedia=wikipedia,
+            fetch_wikipedia=False,
         )
-        persist_records(store, records.values())
+        typer.echo(f"  Wikidata graph loaded: {len(records)} entities")
+        if wikipedia:
+            with typer.progressbar(
+                length=len(records),
+                label="Step 2/3: Fetching Wikipedia passages",
+            ) as progress:
+                populate_wikipedia_passages(
+                    records=records,
+                    settings=settings,
+                    progress=progress.update,
+                )
+        total_passages = sum(len(record.passages) for record in records.values())
+        total_relations = sum(max(len(record.relations), 1) for record in records.values())
+        with typer.progressbar(
+            length=len(records),
+            label="Step 3/3: Writing entities",
+        ) as entity_bar:
+            with typer.progressbar(
+                length=max(total_passages, len(records)),
+                label="           Writing passages",
+            ) as passage_bar:
+                with typer.progressbar(
+                    length=total_relations,
+                    label="           Writing relations",
+                ) as relation_bar:
+                    persist_records(
+                        store,
+                        records.values(),
+                        entity_progress=entity_bar.update,
+                        passage_progress=passage_bar.update,
+                        relation_progress=relation_bar.update,
+                    )
         typer.echo(f"Ingested {len(records)} entities into Neo4j.")
     finally:
         store.close()
@@ -68,7 +104,20 @@ def embed(
         settings.neo4j_database,
     )
     try:
-        embed_passages(store, settings, rebuild=rebuild)
+        result = store.driver.execute_query(
+            """
+            MATCH (p:Passage)
+            WHERE NOT 'embedding' IN keys(p) OR p.embedding IS NULL
+            RETURN count(p) AS total
+            """,
+            database_=store.database,
+        )
+        total = result.records[0]["total"] if result.records else 0
+        with typer.progressbar(
+            length=total,
+            label="Embedding passages",
+        ) as progress:
+            embed_passages(store, settings, rebuild=rebuild, progress=progress.update)
         typer.echo("Passage embeddings created and stored in Neo4j.")
     finally:
         store.close()
@@ -105,6 +154,11 @@ def kg_enrich(
         "--replace-existing/--keep-existing",
         help="Delete the previous KG Builder subgraph for each entity before rebuilding.",
     ),
+    verbose: bool = typer.Option(
+        True,
+        "--verbose/--quiet",
+        help="Show the current Wikipedia page, estimated chunks, and extraction failures.",
+    ),
 ) -> None:
     settings = load_settings()
     store = Neo4jStore(
@@ -114,15 +168,27 @@ def kg_enrich(
         settings.neo4j_database,
     )
     try:
-        enriched = run_kg_builder_enrichment(
-            store=store,
-            settings=settings,
+        candidates = store.list_entities_for_kg_enrichment(
             qids=qid or None,
             limit=limit,
             year_from=year_from,
             year_to=year_to,
-            replace_existing=replace_existing,
         )
+        with typer.progressbar(
+            length=len(candidates),
+            label="KG Builder enriching entities",
+        ) as progress:
+            enriched = run_kg_builder_enrichment(
+                store=store,
+                settings=settings,
+                qids=qid or None,
+                limit=limit,
+                year_from=year_from,
+                year_to=year_to,
+                replace_existing=replace_existing,
+                progress=progress.update,
+                reporter=typer.echo if verbose else None,
+            )
         typer.echo(f"KG Builder enriched {enriched} entities.")
     finally:
         store.close()
@@ -176,6 +242,11 @@ def ask_hybrid(
         "--compare-llm-only",
         help="Also show an answer from the same LLM without any GraphRAG context.",
     ),
+    show_retrieval_only: bool = typer.Option(
+        False,
+        "--show-retrieval-only",
+        help="Also show the retrieved graph/text evidence without any LLM generation.",
+    ),
     show_context: bool = typer.Option(
         False, "--show-context", help="Display the retrieved graph context and sources."
     ),
@@ -188,6 +259,7 @@ def ask_hybrid(
         settings.neo4j_database,
     )
     try:
+        need_context = show_context or show_retrieval_only
         result = ask_hybrid_question(
             store=store,
             settings=settings,
@@ -195,13 +267,18 @@ def ask_hybrid(
             top_k=top_k,
             year_from=year_from,
             year_to=year_to,
-            return_context=show_context,
+            return_context=need_context,
         )
         typer.echo("=== Hybrid GraphRAG Answer ===")
         typer.echo(result.answer)
         if compare_llm_only:
             typer.echo("\n=== LLM Only Answer ===")
             typer.echo(ask_llm_only(settings=settings, question=question))
+        if show_retrieval_only and result.retriever_result:
+            typer.echo("\n=== Retrieval Only ===")
+            for index, item in enumerate(result.retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
         if show_context and result.retriever_result:
             typer.echo("\n=== Context Used ===")
             for index, item in enumerate(result.retriever_result.items, start=1):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+import logging
+import re
+from typing import Callable, Optional
 
 from neo4j_graphrag.experimental.components.text_splitters.fixed_size_splitter import (
     FixedSizeSplitter,
@@ -19,6 +21,9 @@ KG_CHUNK_LABEL = "KgChunk"
 KG_FROM_DOCUMENT = "KG_FROM_DOCUMENT"
 KG_NEXT_CHUNK = "KG_NEXT_CHUNK"
 KG_FROM_CHUNK = "KG_FROM_CHUNK"
+EXTRACTOR_LOGGER_NAME = (
+    "neo4j_graphrag.experimental.components.entity_relation_extractor"
+)
 
 CHRISTIAN_HISTORY_SCHEMA = {
     "node_types": [
@@ -89,6 +94,22 @@ def get_lexical_graph_config() -> LexicalGraphConfig:
     )
 
 
+class KGBuilderLogTracker(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.invalid_json_chunks: set[int] = set()
+        self.improper_format_chunks: set[int] = set()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        match = re.search(r"chunk_index=(\d+)", message)
+        chunk_index = int(match.group(1)) if match else None
+        if "not valid JSON" in message and chunk_index is not None:
+            self.invalid_json_chunks.add(chunk_index)
+        if "improper format" in message and chunk_index is not None:
+            self.improper_format_chunks.add(chunk_index)
+
+
 async def enrich_entities_with_kg_builder(
     store: Neo4jStore,
     settings: Settings,
@@ -97,6 +118,8 @@ async def enrich_entities_with_kg_builder(
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
     replace_existing: bool = True,
+    progress: Optional[Callable[[int], None]] = None,
+    reporter: Optional[Callable[[str], None]] = None,
 ) -> int:
     candidates = store.list_entities_for_kg_enrichment(
         qids=qids,
@@ -126,15 +149,32 @@ async def enrich_entities_with_kg_builder(
         neo4j_database=store.database,
     )
     wikipedia = WikipediaClient(language=settings.wikipedia_language)
+    extractor_logger = logging.getLogger(EXTRACTOR_LOGGER_NAME)
 
     enriched = 0
     for entity in candidates:
+        if reporter:
+            reporter(
+                f"Entity {enriched + 1}/{len(candidates)}: {entity['name']} "
+                f"({entity['wikidata_id']})"
+            )
+            reporter(f"  Wikipedia page: {entity['wikipedia_title']}")
+
         article_text = wikipedia.fetch_article_text(
             entity["wikipedia_title"],
             max_paragraphs=settings.kg_builder_max_paragraphs,
         )
         if not article_text:
+            if reporter:
+                reporter("  Skipped: empty Wikipedia text")
             continue
+
+        estimated_chunks = await splitter.run(article_text)
+        if reporter:
+            reporter(
+                f"  Sending {len(estimated_chunks.chunks)} chunks to KG Builder "
+                f"(chunk_size={settings.kg_builder_chunk_size}, overlap={settings.kg_builder_chunk_overlap})"
+            )
 
         if replace_existing:
             store.delete_kg_subgraph_for_entity(entity["wikidata_id"])
@@ -151,16 +191,40 @@ async def enrich_entities_with_kg_builder(
         if entity.get("time_end_year") is not None:
             document_metadata["time_end_year"] = str(entity["time_end_year"])
 
-        await pipeline.run_async(
-            file_path=entity["wikipedia_url"],
-            text=article_text,
-            document_metadata=document_metadata,
-        )
+        tracker = KGBuilderLogTracker()
+        extractor_logger.addHandler(tracker)
+        try:
+            await pipeline.run_async(
+                file_path=entity["wikipedia_url"],
+                text=article_text,
+                document_metadata=document_metadata,
+            )
+        finally:
+            extractor_logger.removeHandler(tracker)
+
         store.link_entity_to_kg_document(
             wikidata_id=entity["wikidata_id"],
             wikipedia_url=entity["wikipedia_url"],
         )
         enriched += 1
+        if reporter:
+            proper_failures = sorted(tracker.improper_format_chunks)
+            json_failures = sorted(tracker.invalid_json_chunks)
+            total_failures = len(set(proper_failures) | set(json_failures))
+            reporter(
+                f"  Completed: {len(estimated_chunks.chunks) - total_failures}/"
+                f"{len(estimated_chunks.chunks)} chunks extracted cleanly"
+            )
+            if json_failures:
+                reporter(
+                    f"  Invalid JSON chunks: {', '.join(str(index) for index in json_failures)}"
+                )
+            if proper_failures:
+                reporter(
+                    f"  Improper format chunks: {', '.join(str(index) for index in proper_failures)}"
+                )
+        if progress:
+            progress(1)
 
     store.ensure_kg_indexes()
     store.create_kg_chunk_vector_index()
@@ -175,6 +239,8 @@ def run_kg_builder_enrichment(
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
     replace_existing: bool = True,
+    progress: Optional[Callable[[int], None]] = None,
+    reporter: Optional[Callable[[str], None]] = None,
 ) -> int:
     return asyncio.run(
         enrich_entities_with_kg_builder(
@@ -185,5 +251,7 @@ def run_kg_builder_enrichment(
             year_from=year_from,
             year_to=year_to,
             replace_existing=replace_existing,
+            progress=progress,
+            reporter=reporter,
         )
     )

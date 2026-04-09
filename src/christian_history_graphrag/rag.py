@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from neo4j_graphrag.generation import GraphRAG
 from neo4j_graphrag.generation.types import RagResultModel
@@ -149,7 +149,12 @@ def ask_llm_only(settings: Settings, question: str) -> str:
     return response.content
 
 
-def embed_passages(store: Neo4jStore, settings: Settings, rebuild: bool = False) -> None:
+def embed_passages(
+    store: Neo4jStore,
+    settings: Settings,
+    rebuild: bool = False,
+    progress: Optional[Callable[[int], None]] = None,
+) -> None:
     embedder = build_embedder(settings)
     if rebuild:
         store.drop_vector_index()
@@ -169,12 +174,24 @@ def embed_passages(store: Neo4jStore, settings: Settings, rebuild: bool = False)
     texts = [record["text"] for record in rows]
     ids = [record["element_id"] for record in rows]
     if hasattr(embedder, "embed_documents"):
-        embeddings = embedder.embed_documents(
-            texts,
-            batch_size=settings.embedding_batch_size,
-        )
+        embeddings = []
+        batch_size = max(settings.embedding_batch_size, 1)
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start : start + batch_size]
+            embeddings.extend(
+                embedder.embed_documents(
+                    batch_texts,
+                    batch_size=batch_size,
+                )
+            )
+            if progress:
+                progress(len(batch_texts))
     else:
-        embeddings = [embedder.embed_query(text) for text in texts]
+        embeddings = []
+        for text in texts:
+            embeddings.append(embedder.embed_query(text))
+            if progress:
+                progress(1)
 
     store.create_vector_index(dimensions=len(embeddings[0]))
     upsert_vectors(

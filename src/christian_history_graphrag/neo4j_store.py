@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from neo4j import GraphDatabase
 from neo4j_graphrag.indexes import create_vector_index
@@ -36,7 +36,11 @@ class Neo4jStore:
         for statement in statements:
             self.driver.execute_query(statement, database_=self.database)
 
-    def upsert_entities(self, records: Iterable[EntityRecord]) -> None:
+    def upsert_entities(
+        self,
+        records: Iterable[EntityRecord],
+        progress: Optional[Callable[[int], None]] = None,
+    ) -> None:
         for record in records:
             self.driver.execute_query(
                 """
@@ -73,9 +77,16 @@ class Neo4jStore:
                 },
                 database_=self.database,
             )
+            if progress:
+                progress(1)
 
-    def upsert_relations(self, records: Iterable[EntityRecord]) -> None:
+    def upsert_relations(
+        self,
+        records: Iterable[EntityRecord],
+        progress: Optional[Callable[[int], None]] = None,
+    ) -> None:
         for record in records:
+            relation_count = 0
             for relation in record.relations:
                 self.driver.execute_query(
                     f"""
@@ -91,10 +102,19 @@ class Neo4jStore:
                     },
                     database_=self.database,
                 )
+                relation_count += 1
+            if progress:
+                progress(max(relation_count, 1))
 
-    def upsert_passages(self, records: Iterable[EntityRecord]) -> None:
+    def upsert_passages(
+        self,
+        records: Iterable[EntityRecord],
+        progress: Optional[Callable[[int], None]] = None,
+    ) -> None:
         for record in records:
             if not record.passages:
+                if progress:
+                    progress(1)
                 continue
             self.driver.execute_query(
                 """
@@ -134,6 +154,8 @@ class Neo4jStore:
                     },
                     database_=self.database,
                 )
+            if progress:
+                progress(max(len(record.passages), 1))
 
     def create_vector_index(self, dimensions: int) -> None:
         create_vector_index(
