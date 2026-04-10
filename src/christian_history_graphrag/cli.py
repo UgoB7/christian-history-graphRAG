@@ -6,6 +6,8 @@ from typing import Optional
 import typer
 
 from christian_history_graphrag.checkpoints import IngestCheckpointManager
+from christian_history_graphrag.claims import extract_claims
+from christian_history_graphrag.communities import build_community_reports
 from christian_history_graphrag.config import load_settings
 from christian_history_graphrag.ingest import (
     build_records,
@@ -16,12 +18,15 @@ from christian_history_graphrag.kg_builder import run_kg_builder_enrichment
 from christian_history_graphrag.logging_utils import configure_logging
 from christian_history_graphrag.neo4j_store import Neo4jStore
 from christian_history_graphrag.rag import (
+    ask_claims_question,
     ask_cypher_question,
+    ask_global_question,
     ask_hybrid_question,
     ask_llm_only,
     ask_question,
     embed_passages,
 )
+from christian_history_graphrag.routing import choose_route
 
 app = typer.Typer(help="Christian history GraphRAG starter.")
 
@@ -223,6 +228,122 @@ def kg_enrich(
         store.close()
 
 
+@app.command("claims-enrich")
+def claims_enrich(
+    qid: Optional[list[str]] = typer.Option(
+        None,
+        "--qid",
+        help="Restrict claim extraction to entities that already have KG documents.",
+    ),
+    limit: int = typer.Option(25, help="Maximum number of entities to process."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    replace_existing: bool = typer.Option(
+        True,
+        "--replace-existing/--keep-existing",
+        help="Delete previous Claim nodes for each entity before rebuilding.",
+    ),
+    verbose: bool = typer.Option(
+        True,
+        "--verbose/--quiet",
+        help="Show claim extraction progress per entity.",
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        candidates = store.list_entities_with_kg_documents(
+            qids=qid or None,
+            limit=limit,
+            year_from=year_from,
+            year_to=year_to,
+        )
+        with typer.progressbar(
+            length=len(candidates),
+            label="Extracting claims",
+        ) as progress:
+            stats = extract_claims(
+                store=store,
+                settings=settings,
+                qids=qid or None,
+                limit=limit,
+                year_from=year_from,
+                year_to=year_to,
+                replace_existing=replace_existing,
+                progress=progress.update,
+                reporter=typer.echo if verbose else None,
+            )
+        typer.echo(
+            f"Claim extraction created {stats['claims']} claims across {stats['entities']} entities."
+        )
+    finally:
+        store.close()
+
+
+@app.command("community-build")
+def community_build(
+    qid: Optional[list[str]] = typer.Option(
+        None,
+        "--qid",
+        help="Restrict community reports to entities that already have KG documents.",
+    ),
+    limit: int = typer.Option(25, help="Maximum number of entities to process."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    replace_existing: bool = typer.Option(
+        True,
+        "--replace-existing/--keep-existing",
+        help="Delete previous Community and CommunityReport nodes before rebuilding.",
+    ),
+    verbose: bool = typer.Option(
+        True,
+        "--verbose/--quiet",
+        help="Show community-building progress per entity.",
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        candidates = store.list_entities_with_kg_documents(
+            qids=qid or None,
+            limit=limit,
+            year_from=year_from,
+            year_to=year_to,
+        )
+        with typer.progressbar(
+            length=len(candidates),
+            label="Building community reports",
+        ) as progress:
+            stats = build_community_reports(
+                store=store,
+                settings=settings,
+                qids=qid or None,
+                limit=limit,
+                year_from=year_from,
+                year_to=year_to,
+                replace_existing=replace_existing,
+                progress=progress.update,
+                reporter=typer.echo if verbose else None,
+            )
+        typer.echo(
+            f"Built {stats['reports']} community reports across {stats['communities']} communities."
+        )
+    finally:
+        store.close()
+
+
 @app.command()
 def ask(
     question: str = typer.Argument(..., help="Question to ask over the graph."),
@@ -251,6 +372,92 @@ def ask(
             year_to=year_to,
             return_context=show_context,
         )
+        typer.echo(result.answer)
+        if show_context and result.retriever_result:
+            typer.echo("\n=== Context Used ===")
+            for index, item in enumerate(result.retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
+    finally:
+        store.close()
+
+
+@app.command("ask-claims")
+def ask_claims(
+    question: str = typer.Argument(..., help="Question to ask over extracted Claim nodes."),
+    top_k: int = typer.Option(5, help="How many claims to retrieve."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    show_context: bool = typer.Option(
+        False, "--show-context", help="Display the retrieved claim context and sources."
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        if not store.has_claims():
+            typer.echo("No Claim nodes found. Run `christian-history-graphrag claims-enrich` first.")
+            raise typer.Exit(code=1)
+        result = ask_claims_question(
+            store=store,
+            settings=settings,
+            question=question,
+            top_k=top_k,
+            year_from=year_from,
+            year_to=year_to,
+            return_context=show_context,
+        )
+        typer.echo("=== Claim GraphRAG Answer ===")
+        typer.echo(result.answer)
+        if show_context and result.retriever_result:
+            typer.echo("\n=== Context Used ===")
+            for index, item in enumerate(result.retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
+    finally:
+        store.close()
+
+
+@app.command("ask-global")
+def ask_global(
+    question: str = typer.Argument(..., help="Question to ask over community reports."),
+    top_k: int = typer.Option(4, help="How many community reports to retrieve."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    show_context: bool = typer.Option(
+        False, "--show-context", help="Display the retrieved community report context."
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        if not store.has_community_reports():
+            typer.echo(
+                "No CommunityReport nodes found. Run `christian-history-graphrag community-build` first."
+            )
+            raise typer.Exit(code=1)
+        result = ask_global_question(
+            store=store,
+            settings=settings,
+            question=question,
+            top_k=top_k,
+            year_from=year_from,
+            year_to=year_to,
+            return_context=show_context,
+        )
+        typer.echo("=== Global GraphRAG Answer ===")
         typer.echo(result.answer)
         if show_context and result.retriever_result:
             typer.echo("\n=== Context Used ===")
@@ -293,6 +500,113 @@ def ask_cypher(
         retriever_result = result.retriever_result
         metadata = retriever_result.metadata if retriever_result else {}
         if show_generated_cypher and metadata.get("cypher"):
+            typer.echo("\n=== Generated Cypher ===")
+            typer.echo(str(metadata["cypher"]))
+        if show_context and retriever_result:
+            typer.echo("\n=== Context Used ===")
+            for index, item in enumerate(retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
+    finally:
+        store.close()
+
+
+@app.command("ask-router")
+def ask_router(
+    question: str = typer.Argument(..., help="Question to route to the best GraphRAG mode."),
+    top_k: int = typer.Option(5, help="How many items to retrieve for retriever-based routes."),
+    year_from: Optional[int] = typer.Option(None, help="Lower time bound."),
+    year_to: Optional[int] = typer.Option(None, help="Upper time bound."),
+    show_route: bool = typer.Option(
+        True,
+        "--show-route/--hide-route",
+        help="Display the route chosen by the router.",
+    ),
+    show_context: bool = typer.Option(
+        False,
+        "--show-context",
+        help="Display the retrieved context from the chosen route.",
+    ),
+    show_generated_cypher: bool = typer.Option(
+        False,
+        "--show-generated-cypher",
+        help="When the router picks the cypher route, display the generated query.",
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        decision = choose_route(store, settings, question)
+        if decision.route == "local":
+            result = ask_question(
+                store=store,
+                settings=settings,
+                question=question,
+                top_k=top_k,
+                year_from=year_from,
+                year_to=year_to,
+                return_context=show_context,
+            )
+            header = "=== Routed Base GraphRAG Answer ==="
+        elif decision.route == "hybrid":
+            result = ask_hybrid_question(
+                store=store,
+                settings=settings,
+                question=question,
+                top_k=top_k,
+                year_from=year_from,
+                year_to=year_to,
+                return_context=show_context,
+            )
+            header = "=== Routed Hybrid GraphRAG Answer ==="
+        elif decision.route == "claims":
+            result = ask_claims_question(
+                store=store,
+                settings=settings,
+                question=question,
+                top_k=top_k,
+                year_from=year_from,
+                year_to=year_to,
+                return_context=show_context,
+            )
+            header = "=== Routed Claim GraphRAG Answer ==="
+        elif decision.route == "global":
+            result = ask_global_question(
+                store=store,
+                settings=settings,
+                question=question,
+                top_k=max(1, min(top_k, 8)),
+                year_from=year_from,
+                year_to=year_to,
+                return_context=show_context,
+            )
+            header = "=== Routed Global GraphRAG Answer ==="
+        else:
+            result = ask_cypher_question(
+                store=store,
+                settings=settings,
+                question=question,
+                return_context=show_context,
+            )
+            header = "=== Routed Text2Cypher Answer ==="
+
+        if show_route:
+            typer.echo("=== Route ===")
+            typer.echo(f"Route: {decision.route}")
+            typer.echo(f"Reason: {decision.reason}")
+            typer.echo("")
+
+        typer.echo(header)
+        typer.echo(result.answer)
+        retriever_result = result.retriever_result
+        metadata = retriever_result.metadata if retriever_result else {}
+        if decision.route == "cypher" and show_generated_cypher and metadata.get("cypher"):
             typer.echo("\n=== Generated Cypher ===")
             typer.echo(str(metadata["cypher"]))
         if show_context and retriever_result:

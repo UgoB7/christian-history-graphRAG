@@ -45,6 +45,13 @@ class Settings:
     http_backoff_factor: float
     log_level: str
     entity_resolution_similarity_threshold: float
+    claim_extraction_llm_model: str
+    claim_max_per_chunk: int
+    community_report_llm_model: str
+    community_report_member_limit: int
+    community_report_claim_limit: int
+    community_report_relation_limit: int
+    router_llm_model: str
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -113,5 +120,24 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         entity_resolution_similarity_threshold=_get_float(
             "ENTITY_RESOLUTION_SIMILARITY_THRESHOLD", 0.9
+        ),
+        claim_extraction_llm_model=os.getenv(
+            "CLAIM_EXTRACTION_LLM_MODEL",
+            os.getenv("KG_BUILDER_LLM_MODEL", os.getenv("LLM_MODEL", "qwen2.5:3b")),
+        ),
+        claim_max_per_chunk=_get_int("CLAIM_MAX_PER_CHUNK", 5),
+        community_report_llm_model=os.getenv(
+            "COMMUNITY_REPORT_LLM_MODEL",
+            os.getenv("LLM_MODEL", "gemma4:e2b"),
+        ),
+        community_report_member_limit=_get_int("COMMUNITY_REPORT_MEMBER_LIMIT", 20),
+        community_report_claim_limit=_get_int("COMMUNITY_REPORT_CLAIM_LIMIT", 12),
+        community_report_relation_limit=_get_int(
+            "COMMUNITY_REPORT_RELATION_LIMIT",
+            20,
+        ),
+        router_llm_model=os.getenv(
+            "ROUTER_LLM_MODEL",
+            os.getenv("LLM_MODEL", "gemma4:e2b"),
         ),
     )

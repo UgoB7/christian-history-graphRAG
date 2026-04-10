@@ -35,8 +35,10 @@ Le projet repart aussi proprement de zéro pour les données et embeddings grâc
 5. on écrit `:Entity` et `:Passage` dans Neo4j;
 6. on écrit aussi des `:Statement` et `:SourceDocument` pour conserver les faits Wikidata et leur provenance;
 7. on peut enrichir les articles Wikipedia avec `SimpleKGPipeline` pour créer `:KgDocument`, `:KgChunk` et un graphe extrait par LLM;
-8. on calcule les embeddings localement;
-9. on interroge soit le graphe de base, soit le graphe hybride avec retrieval hybride Neo4j et des filtres temporels.
+8. on peut extraire des `:Claim` atomiques depuis les `KgChunk`;
+9. on peut synthétiser des `:CommunityReport` par voisinage d’entité enrichie;
+10. on calcule les embeddings localement;
+11. on interroge soit le graphe de base, soit le graphe hybride, soit les claims, soit les community reports.
 
 ## Modèle de données
 
@@ -48,6 +50,9 @@ Le projet repart aussi proprement de zéro pour les données et embeddings grâc
 - `(:SourceDocument {source_id, source_system, source_url, title, revision_id, content_hash, retrieved_at})`
 - `(:KgDocument {path, wikidata_id, wikipedia_title, wikipedia_url, source})`
 - `(:KgChunk {text, index, embedding})`
+- `(:Claim {claim_id, claim_text, subject, predicate, object_value, claim_type, confidence, provenance_quote})`
+- `(:Community {community_id, title, focus_entity_qid})`
+- `(:CommunityReport {report_id, title, summary, report_text, themes, key_entities, key_claims, embedding})`
 
 ### Relations
 
@@ -61,6 +66,15 @@ Le projet repart aussi proprement de zéro pour les données et embeddings grâc
 - `(:KgChunk)-[:KG_FROM_DOCUMENT]->(:KgDocument)`
 - `(:ExtractedNode)-[:KG_FROM_CHUNK]->(:KgChunk)`
 - `(:ExtractedNode)-[:RESOLVES_TO]->(:Entity)`
+- `(:Entity)-[:HAS_CLAIM]->(:Claim)`
+- `(:Claim)-[:CLAIM_FROM_CHUNK]->(:KgChunk)`
+- `(:Claim)-[:CLAIM_FROM_DOCUMENT]->(:KgDocument)`
+- `(:Claim)-[:CLAIM_SUBJECT]->(:Entity)`
+- `(:Claim)-[:CLAIM_OBJECT]->(:Entity)`
+- `(:Entity)-[:HAS_COMMUNITY]->(:Community)`
+- `(:Community)-[:HAS_MEMBER]->(:Entity|:ExtractedNode)`
+- `(:Community)-[:HAS_CLAIM]->(:Claim)`
+- `(:Community)-[:HAS_REPORT]->(:CommunityReport)`
 - relations Wikidata normalisées comme `:PART_OF`, `:HAS_PARTICIPANT`, `:LOCATED_IN`, `:INFLUENCED_BY`
 
 ## Installation
@@ -104,6 +118,9 @@ Variables importantes:
 - `LLM_PROVIDER=ollama`
 - `LLM_MODEL=gemma4:e2b`
 - `KG_BUILDER_LLM_MODEL=qwen2.5:3b`
+- `CLAIM_EXTRACTION_LLM_MODEL=qwen2.5:3b`
+- `COMMUNITY_REPORT_LLM_MODEL=gemma4:e2b`
+- `ROUTER_LLM_MODEL=gemma4:e2b`
 - `LLM_BASE_URL=http://localhost:11434`
 - `EMBEDDING_PROVIDER=sentence-transformers`
 - `EMBEDDING_MODEL=BAAI/bge-m3`
@@ -209,6 +226,38 @@ Cette commande:
 - relie le `KgDocument` à ton noeud `:Entity` existant
 - crée un index vectoriel sur `:KgChunk.embedding`
 
+## Extraction de claims
+
+Exemple:
+
+```bash
+christian-history-graphrag claims-enrich --limit 15 --replace-existing
+```
+
+Cette commande:
+
+- parcourt les `KgChunk` déjà créés par `kg-enrich`
+- demande au LLM d’extraire des claims atomiques et sourçables
+- crée des nœuds `:Claim`
+- relie chaque claim à son chunk, son document et son entité canonique
+- tente aussi de résoudre le sujet et l’objet vers des `:Entity`
+- crée un index vectoriel et fulltext sur les claims
+
+## Community reports
+
+Exemple:
+
+```bash
+christian-history-graphrag community-build --limit 15 --replace-existing
+```
+
+Cette commande:
+
+- construit une communauté locale par entité enrichie
+- rassemble les nœuds extraits, entités résolues, relations saillantes et claims
+- demande au LLM de rédiger un `CommunityReport`
+- stocke un résumé compressé et indexé pour la recherche globale
+
 ## Poser une question
 
 ```bash
@@ -255,6 +304,39 @@ christian-history-graphrag ask-cypher \
 ```
 
 Cette commande utilise `Text2CypherRetriever` pour générer puis exécuter une requête Cypher sur le schéma Neo4j courant.
+
+Pour interroger directement la couche claims:
+
+```bash
+christian-history-graphrag ask-claims \
+  "Quelles assertions sourcées concernent Andrew the Apostle ?" \
+  --show-context
+```
+
+Pour interroger les synthèses globales:
+
+```bash
+christian-history-graphrag ask-global \
+  "Quels grands thèmes ressortent autour des apôtres ?" \
+  --show-context
+```
+
+Pour laisser le routeur choisir le meilleur mode:
+
+```bash
+christian-history-graphrag ask-router \
+  "Quels grands thèmes ressortent autour des apôtres ?" \
+  --show-route \
+  --show-context
+```
+
+`ask-router` choisit entre:
+
+- `ask` pour le RAG canonique de base
+- `ask-hybrid` pour le sous-graphe enrichi
+- `ask-claims` pour les assertions atomiques sourcées
+- `ask-global` pour les community reports
+- `ask-cypher` pour les questions structurelles
 
 ## Robustesse V1
 

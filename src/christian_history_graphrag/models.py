@@ -72,6 +72,48 @@ class EntityRecord:
     source_documents: list[SourceDocument] = field(default_factory=list)
 
 
+@dataclass
+class ClaimRecord:
+    claim_id: str
+    claim_text: str
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    object_value: Optional[str] = None
+    claim_type: str = "factual"
+    confidence: float = 0.5
+    provenance_quote: Optional[str] = None
+    chunk_element_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    document_path: Optional[str] = None
+    root_entity_qid: Optional[str] = None
+    root_entity_name: Optional[str] = None
+    subject_entity_qid: Optional[str] = None
+    object_entity_qid: Optional[str] = None
+    extracted_at: Optional[str] = None
+    extraction_model: Optional[str] = None
+
+
+@dataclass
+class CommunityReportRecord:
+    community_id: str
+    report_id: str
+    title: str
+    summary: str
+    themes: list[str] = field(default_factory=list)
+    key_entities: list[str] = field(default_factory=list)
+    key_claims: list[str] = field(default_factory=list)
+    question_suggestions: list[str] = field(default_factory=list)
+    report_text: str = ""
+    focus_entity_qid: Optional[str] = None
+    focus_entity_name: Optional[str] = None
+    source_url: Optional[str] = None
+    time_start_year: Optional[int] = None
+    time_end_year: Optional[int] = None
+    generated_at: Optional[str] = None
+    generation_model: Optional[str] = None
+
+
 def entity_record_to_dict(record: EntityRecord) -> dict[str, Any]:
     return asdict(record)
 
