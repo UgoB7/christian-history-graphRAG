@@ -33,9 +33,10 @@ Le projet repart aussi proprement de zéro pour les données et embeddings grâc
 3. on extrait plusieurs paragraphes de Wikipedia;
 4. on découpe ces paragraphes en chunks;
 5. on écrit `:Entity` et `:Passage` dans Neo4j;
-6. on peut enrichir les articles Wikipedia avec `SimpleKGPipeline` pour créer `:KgDocument`, `:KgChunk` et un graphe extrait par LLM;
-7. on calcule les embeddings localement;
-8. on interroge soit le graphe de base, soit le graphe hybride avec `VectorCypherRetriever` et des filtres temporels.
+6. on écrit aussi des `:Statement` et `:SourceDocument` pour conserver les faits Wikidata et leur provenance;
+7. on peut enrichir les articles Wikipedia avec `SimpleKGPipeline` pour créer `:KgDocument`, `:KgChunk` et un graphe extrait par LLM;
+8. on calcule les embeddings localement;
+9. on interroge soit le graphe de base, soit le graphe hybride avec retrieval hybride Neo4j et des filtres temporels.
 
 ## Modèle de données
 
@@ -43,15 +44,23 @@ Le projet repart aussi proprement de zéro pour les données et embeddings grâc
 
 - `(:Entity {wikidata_id, name, description, entity_kind, time_start_year, time_end_year, latitude, longitude, wikipedia_url})`
 - `(:Passage {id, title, chunk_index, text, source, language, time_start_year, time_end_year, embedding})`
+- `(:Statement {statement_id, property_id, relation_type, rank, reference_count, qualifiers_json, source_url})`
+- `(:SourceDocument {source_id, source_system, source_url, title, revision_id, content_hash, retrieved_at})`
 - `(:KgDocument {path, wikidata_id, wikipedia_title, wikipedia_url, source})`
 - `(:KgChunk {text, index, embedding})`
 
 ### Relations
 
 - `(:Entity)-[:HAS_PASSAGE]->(:Passage)`
+- `(:Entity)-[:HAS_STATEMENT]->(:Statement)`
+- `(:Statement)-[:TARGETS]->(:Entity)`
+- `(:Statement)-[:SUPPORTED_BY]->(:SourceDocument)`
+- `(:Entity)-[:HAS_SOURCE]->(:SourceDocument)`
+- `(:Passage)-[:DERIVED_FROM]->(:SourceDocument)`
 - `(:Entity)-[:HAS_KG_DOCUMENT]->(:KgDocument)`
 - `(:KgChunk)-[:KG_FROM_DOCUMENT]->(:KgDocument)`
 - `(:ExtractedNode)-[:KG_FROM_CHUNK]->(:KgChunk)`
+- `(:ExtractedNode)-[:RESOLVES_TO]->(:Entity)`
 - relations Wikidata normalisées comme `:PART_OF`, `:HAS_PARTICIPANT`, `:LOCATED_IN`, `:INFLUENCED_BY`
 
 ## Installation
@@ -99,6 +108,10 @@ Variables importantes:
 - `EMBEDDING_PROVIDER=sentence-transformers`
 - `EMBEDDING_MODEL=BAAI/bge-m3`
 - `EMBEDDING_DEVICE=cpu` ou `cuda`
+- `CACHE_DIR=.graphrag/cache`
+- `CHECKPOINT_DIR=.graphrag/checkpoints`
+- `HTTP_MAX_RETRIES=4`
+- `LOG_LEVEL=INFO`
 
 Recommandation pratique sur Mac:
 
@@ -150,8 +163,11 @@ Cette commande:
 
 - récupère les entités Wikidata
 - suit les relations utiles
+- conserve des `Statement` avec `statement_id`, `rank`, qualifiers et références agrégées
 - télécharge plusieurs paragraphes Wikipedia
 - les découpe en plusieurs chunks
+- crée des `SourceDocument` pour Wikidata et Wikipedia
+- met en cache les appels HTTP et écrit des checkpoints d’ingestion
 - écrit tout dans Neo4j
 
 ## Embeddings
@@ -189,6 +205,7 @@ Cette commande:
 - lance `SimpleKGPipeline(from_pdf=False, text=...)`
 - crée un sous-graphe lexical `KgDocument -> KgChunk`
 - extrait des entités et relations supplémentaires depuis le texte
+- résout les nœuds extraits vers les `:Entity` canoniques quand un match robuste existe
 - relie le `KgDocument` à ton noeud `:Entity` existant
 - crée un index vectoriel sur `:KgChunk.embedding`
 
@@ -227,6 +244,29 @@ christian-history-graphrag ask-hybrid \
 - `KgChunk -> KgDocument`
 - `Entity -> KgDocument`
 - noeuds et relations extraits par `KG Builder`
+
+Pour les questions plus structurelles sur le graphe:
+
+```bash
+christian-history-graphrag ask-cypher \
+  "Quels conciles ont eu lieu au IVe siècle ?" \
+  --show-generated-cypher \
+  --show-context
+```
+
+Cette commande utilise `Text2CypherRetriever` pour générer puis exécuter une requête Cypher sur le schéma Neo4j courant.
+
+## Robustesse V1
+
+Le projet inclut maintenant une première couche de robustesse:
+
+- `Statement` et `SourceDocument` pour conserver les faits et leur provenance
+- retries HTTP avec backoff pour Wikidata et Wikipedia
+- cache disque local dans `.graphrag/cache`
+- checkpoints d’ingestion dans `.graphrag/checkpoints`
+- retrieval hybride `HybridCypherRetriever` sur `Passage` et `KgChunk`
+- `Text2CypherRetriever` pour les questions structurelles
+- résolution d’entités extraites vers les `:Entity` canoniques
 
 ## Voir le graphe
 

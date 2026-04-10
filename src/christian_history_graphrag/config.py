@@ -36,6 +36,15 @@ class Settings:
     kg_builder_chunk_size: int
     kg_builder_chunk_overlap: int
     kg_builder_schema_mode: str
+    cache_dir: str
+    cache_ttl_seconds: int
+    checkpoint_dir: str
+    use_http_cache: bool
+    use_ingest_checkpoints: bool
+    http_max_retries: int
+    http_backoff_factor: float
+    log_level: str
+    entity_resolution_similarity_threshold: float
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -94,4 +103,15 @@ def load_settings() -> Settings:
         kg_builder_chunk_size=_get_int("KG_BUILDER_CHUNK_SIZE", 1800),
         kg_builder_chunk_overlap=_get_int("KG_BUILDER_CHUNK_OVERLAP", 150),
         kg_builder_schema_mode=os.getenv("KG_BUILDER_SCHEMA_MODE", "GUIDED"),
+        cache_dir=os.getenv("CACHE_DIR", ".graphrag/cache"),
+        cache_ttl_seconds=_get_int("CACHE_TTL_SECONDS", 60 * 60 * 24 * 7),
+        checkpoint_dir=os.getenv("CHECKPOINT_DIR", ".graphrag/checkpoints"),
+        use_http_cache=_get_bool("USE_HTTP_CACHE", True),
+        use_ingest_checkpoints=_get_bool("USE_INGEST_CHECKPOINTS", True),
+        http_max_retries=_get_int("HTTP_MAX_RETRIES", 4),
+        http_backoff_factor=_get_float("HTTP_BACKOFF_FACTOR", 0.5),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        entity_resolution_similarity_threshold=_get_float(
+            "ENTITY_RESOLUTION_SIMILARITY_THRESHOLD", 0.9
+        ),
     )

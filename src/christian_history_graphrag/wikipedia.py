@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
 
+from christian_history_graphrag.config import Settings
+from christian_history_graphrag.http_utils import FileHTTPCache, build_retry_session
 from christian_history_graphrag.models import WikipediaPassage
 
 
+logger = logging.getLogger(__name__)
+
+
 class WikipediaClient:
-    def __init__(self, language: str = "en", session: Optional[requests.Session] = None):
-        self.language = language
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "User-Agent": "christian-history-graphrag/0.1",
-            }
+    def __init__(
+        self,
+        language: str = "en",
+        session: Optional[requests.Session] = None,
+        settings: Optional[Settings] = None,
+    ):
+        self.language = language if settings is None else settings.wikipedia_language
+        self.settings = settings
+        self.session = build_retry_session(
+            user_agent="christian-history-graphrag/0.1",
+            max_retries=settings.http_max_retries if settings else 4,
+            backoff_factor=settings.http_backoff_factor if settings else 0.5,
+            session=session,
+        )
+        self.cache = FileHTTPCache(
+            settings.cache_dir if settings else ".graphrag/cache",
+            enabled=settings.use_http_cache if settings else True,
+            ttl_seconds=settings.cache_ttl_seconds if settings else 60 * 60 * 24 * 7,
         )
 
     @property
@@ -31,19 +49,10 @@ class WikipediaClient:
         chunk_size: int = 1400,
         paragraph_overlap: int = 1,
     ) -> list[WikipediaPassage]:
-        response = self.session.get(
-            self.api_url,
-            params={
-                "action": "parse",
-                "page": page_title,
-                "prop": "text",
-                "format": "json",
-                "formatversion": "2",
-            },
-            timeout=30,
+        payload = self._fetch_parse_payload(
+            page_title=page_title,
+            max_paragraphs=max_paragraphs,
         )
-        response.raise_for_status()
-        payload = response.json()
         html = payload["parse"]["text"]
         paragraphs = self._html_to_paragraphs(html, max_paragraphs=max_paragraphs)
         chunks = self._chunk_paragraphs(
@@ -53,6 +62,12 @@ class WikipediaClient:
         )
 
         url = f"https://{self.language}.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
+        revision_id = payload.get("parse", {}).get("revid")
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        content_hash = hashlib.sha256(
+            "\n\n".join(paragraphs).encode("utf-8")
+        ).hexdigest()
+        source_document_id = f"wikipedia:{self.language}:{page_title.replace(' ', '_')}"
         passages = []
         for index, chunk in enumerate(chunks):
             passages.append(
@@ -63,27 +78,65 @@ class WikipediaClient:
                     language=self.language,
                     chunk_index=index,
                     text=chunk,
+                    source_document_id=source_document_id,
+                    retrieved_at=retrieved_at,
+                    revision_id=revision_id,
+                    content_hash=content_hash,
                 )
             )
         return passages
 
     def fetch_article_text(self, page_title: str, max_paragraphs: int = 40) -> str:
+        payload = self._fetch_parse_payload(page_title=page_title, max_paragraphs=max_paragraphs)
+        html = payload["parse"]["text"]
+        paragraphs = self._html_to_paragraphs(html, max_paragraphs=max_paragraphs)
+        return "\n\n".join(paragraphs)
+
+    def fetch_source_metadata(
+        self, page_title: str, max_paragraphs: int = 40
+    ) -> dict[str, object]:
+        payload = self._fetch_parse_payload(page_title=page_title, max_paragraphs=max_paragraphs)
+        html = payload["parse"]["text"]
+        paragraphs = self._html_to_paragraphs(html, max_paragraphs=max_paragraphs)
+        revision_id = payload.get("parse", {}).get("revid")
+        text = "\n\n".join(paragraphs)
+        return {
+            "source_id": f"wikipedia:{self.language}:{page_title.replace(' ', '_')}",
+            "source_system": "wikipedia",
+            "source_url": f"https://{self.language}.wikipedia.org/wiki/{page_title.replace(' ', '_')}",
+            "title": page_title,
+            "language": self.language,
+            "revision_id": revision_id,
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {
+                "paragraph_count": len(paragraphs),
+            },
+        }
+
+    def _fetch_parse_payload(self, page_title: str, max_paragraphs: int) -> dict:
+        params = {
+            "action": "parse",
+            "page": page_title,
+            "prop": "text|revid",
+            "format": "json",
+            "formatversion": "2",
+        }
+        cached_payload = self.cache.get_json("wikipedia-parse", self.api_url, params)
+        if cached_payload is not None:
+            return cached_payload
+
         response = self.session.get(
             self.api_url,
-            params={
-                "action": "parse",
-                "page": page_title,
-                "prop": "text",
-                "format": "json",
-                "formatversion": "2",
-            },
+            params=params,
             timeout=30,
         )
         response.raise_for_status()
         payload = response.json()
-        html = payload["parse"]["text"]
-        paragraphs = self._html_to_paragraphs(html, max_paragraphs=max_paragraphs)
-        return "\n\n".join(paragraphs)
+        if "error" in payload:
+            logger.warning("Wikipedia API error for %s: %s", page_title, payload["error"])
+        self.cache.set_json("wikipedia-parse", self.api_url, params, payload)
+        return payload
 
     def _html_to_paragraphs(self, html: str, max_paragraphs: int) -> list[str]:
         soup = BeautifulSoup(html, "html.parser")

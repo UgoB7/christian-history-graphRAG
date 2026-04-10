@@ -5,6 +5,7 @@ from typing import Optional
 
 import typer
 
+from christian_history_graphrag.checkpoints import IngestCheckpointManager
 from christian_history_graphrag.config import load_settings
 from christian_history_graphrag.ingest import (
     build_records,
@@ -12,8 +13,10 @@ from christian_history_graphrag.ingest import (
     populate_wikipedia_passages,
 )
 from christian_history_graphrag.kg_builder import run_kg_builder_enrichment
+from christian_history_graphrag.logging_utils import configure_logging
 from christian_history_graphrag.neo4j_store import Neo4jStore
 from christian_history_graphrag.rag import (
+    ask_cypher_question,
     ask_hybrid_question,
     ask_llm_only,
     ask_question,
@@ -35,13 +38,27 @@ def ingest(
     reset_db: bool = typer.Option(
         False, "--reset-db", help="Delete existing graph data before ingesting."
     ),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Reuse ingest checkpoints for the same seeds/depth/language when available.",
+    ),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
         settings.neo4j_password,
         settings.neo4j_database,
+    )
+    checkpoint_manager = IngestCheckpointManager(
+        settings.checkpoint_dir,
+        seed_qids=seed_qid,
+        depth=depth,
+        language=settings.wikipedia_language,
+        wikipedia_enabled=wikipedia,
+        enabled=settings.use_ingest_checkpoints and resume,
     )
     try:
         if reset_db:
@@ -52,6 +69,7 @@ def ingest(
             settings=settings,
             max_depth=depth,
             fetch_wikipedia=False,
+            checkpoint_manager=checkpoint_manager,
         )
         typer.echo(f"  Wikidata graph loaded: {len(records)} entities")
         if wikipedia:
@@ -63,28 +81,35 @@ def ingest(
                     records=records,
                     settings=settings,
                     progress=progress.update,
+                    checkpoint_manager=checkpoint_manager,
                 )
         total_passages = sum(len(record.passages) for record in records.values())
+        total_sources = sum(max(len(record.source_documents), 1) for record in records.values())
         total_relations = sum(max(len(record.relations), 1) for record in records.values())
         with typer.progressbar(
             length=len(records),
             label="Step 3/3: Writing entities",
         ) as entity_bar:
             with typer.progressbar(
-                length=max(total_passages, len(records)),
-                label="           Writing passages",
-            ) as passage_bar:
+                length=total_sources,
+                label="           Writing sources",
+            ) as source_bar:
                 with typer.progressbar(
-                    length=total_relations,
-                    label="           Writing relations",
-                ) as relation_bar:
-                    persist_records(
-                        store,
-                        records.values(),
-                        entity_progress=entity_bar.update,
-                        passage_progress=passage_bar.update,
-                        relation_progress=relation_bar.update,
-                    )
+                    length=max(total_passages, len(records)),
+                    label="           Writing passages",
+                ) as passage_bar:
+                    with typer.progressbar(
+                        length=total_relations,
+                        label="           Writing relations",
+                    ) as relation_bar:
+                        persist_records(
+                            store,
+                            records.values(),
+                            entity_progress=entity_bar.update,
+                            source_progress=source_bar.update,
+                            passage_progress=passage_bar.update,
+                            relation_progress=relation_bar.update,
+                        )
         typer.echo(f"Ingested {len(records)} entities into Neo4j.")
     finally:
         store.close()
@@ -97,6 +122,7 @@ def embed(
     ),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
@@ -107,9 +133,10 @@ def embed(
         result = store.driver.execute_query(
             """
             MATCH (p:Passage)
-            WHERE NOT 'embedding' IN keys(p) OR p.embedding IS NULL
+            WHERE $rebuild OR NOT 'embedding' IN keys(p) OR p.embedding IS NULL
             RETURN count(p) AS total
             """,
+            {"rebuild": rebuild},
             database_=store.database,
         )
         total = result.records[0]["total"] if result.records else 0
@@ -126,6 +153,7 @@ def embed(
 @app.command("reset-db")
 def reset_db() -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
@@ -161,6 +189,7 @@ def kg_enrich(
     ),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
@@ -205,6 +234,7 @@ def ask(
     ),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
@@ -225,6 +255,49 @@ def ask(
         if show_context and result.retriever_result:
             typer.echo("\n=== Context Used ===")
             for index, item in enumerate(result.retriever_result.items, start=1):
+                typer.echo(f"\n[{index}]")
+                typer.echo(str(item.content))
+    finally:
+        store.close()
+
+
+@app.command("ask-cypher")
+def ask_cypher(
+    question: str = typer.Argument(..., help="Question to answer with Text2Cypher over the graph."),
+    show_generated_cypher: bool = typer.Option(
+        False,
+        "--show-generated-cypher",
+        help="Display the generated Cypher query.",
+    ),
+    show_context: bool = typer.Option(
+        False, "--show-context", help="Display the retrieved rows used as context."
+    ),
+) -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    store = Neo4jStore(
+        settings.neo4j_uri,
+        settings.neo4j_username,
+        settings.neo4j_password,
+        settings.neo4j_database,
+    )
+    try:
+        result = ask_cypher_question(
+            store=store,
+            settings=settings,
+            question=question,
+            return_context=show_context,
+        )
+        typer.echo("=== Text2Cypher Answer ===")
+        typer.echo(result.answer)
+        retriever_result = result.retriever_result
+        metadata = retriever_result.metadata if retriever_result else {}
+        if show_generated_cypher and metadata.get("cypher"):
+            typer.echo("\n=== Generated Cypher ===")
+            typer.echo(str(metadata["cypher"]))
+        if show_context and retriever_result:
+            typer.echo("\n=== Context Used ===")
+            for index, item in enumerate(retriever_result.items, start=1):
                 typer.echo(f"\n[{index}]")
                 typer.echo(str(item.content))
     finally:
@@ -252,6 +325,7 @@ def ask_hybrid(
     ),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,
@@ -295,6 +369,7 @@ def subgraph(
     limit: int = typer.Option(50, help="Maximum number of rows."),
 ) -> None:
     settings = load_settings()
+    configure_logging(settings.log_level)
     store = Neo4jStore(
         settings.neo4j_uri,
         settings.neo4j_username,

@@ -13,6 +13,7 @@ from neo4j_graphrag.experimental.components.types import LexicalGraphConfig
 from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
 
 from christian_history_graphrag.config import Settings
+from christian_history_graphrag.entity_resolution import resolve_extracted_entities
 from christian_history_graphrag.neo4j_store import Neo4jStore
 from christian_history_graphrag.providers import build_embedder, build_llm
 from christian_history_graphrag.wikipedia import WikipediaClient
@@ -149,7 +150,7 @@ async def enrich_entities_with_kg_builder(
         on_error="IGNORE",
         neo4j_database=store.database,
     )
-    wikipedia = WikipediaClient(language=settings.wikipedia_language)
+    wikipedia = WikipediaClient(settings=settings)
     extractor_logger = logging.getLogger(EXTRACTOR_LOGGER_NAME)
 
     enriched = 0
@@ -242,6 +243,12 @@ async def enrich_entities_with_kg_builder(
 
     store.ensure_kg_indexes()
     store.create_kg_chunk_vector_index()
+    resolve_extracted_entities(
+        store,
+        settings,
+        replace_existing=replace_existing,
+        reporter=reporter,
+    )
     return enriched
 
 

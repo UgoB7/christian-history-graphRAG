@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from typing import Callable, Optional
 
 from neo4j_graphrag.generation import GraphRAG
 from neo4j_graphrag.generation.types import RagResultModel
 from neo4j_graphrag.indexes import upsert_vectors
-from neo4j_graphrag.retrievers import VectorCypherRetriever
+from neo4j_graphrag.retrievers import HybridCypherRetriever, Text2CypherRetriever
 from neo4j_graphrag.types import EntityType, RetrieverResultItem
 
 from christian_history_graphrag.config import Settings
@@ -15,6 +16,7 @@ from christian_history_graphrag.providers import build_embedder, build_llm
 
 RETRIEVAL_QUERY = """
 OPTIONAL MATCH (node)<-[:HAS_PASSAGE]-(entity:Entity)
+OPTIONAL MATCH (node)-[:DERIVED_FROM]->(source_doc:SourceDocument)
 OPTIONAL MATCH (entity)-[r]-(neighbor:Entity)
 WHERE ($year_from IS NULL OR coalesce(entity.time_end_year, entity.time_start_year, 999999) >= $year_from)
   AND ($year_to IS NULL OR coalesce(entity.time_start_year, entity.time_end_year, -999999) <= $year_to)
@@ -29,6 +31,7 @@ RETURN
   entity.time_start_year AS start_year,
   entity.time_end_year AS end_year,
   entity.wikipedia_url AS wikipedia_url,
+  source_doc.source_url AS provenance_url,
   collect(DISTINCT {
     relation: type(r),
     target: neighbor.name,
@@ -40,6 +43,7 @@ RETURN
 HYBRID_RETRIEVAL_QUERY = """
 OPTIONAL MATCH (node)-[:KG_FROM_DOCUMENT]->(doc:KgDocument)
 OPTIONAL MATCH (entity:Entity)-[:HAS_KG_DOCUMENT]->(doc)
+OPTIONAL MATCH (entity)-[:HAS_SOURCE]->(entity_source:SourceDocument {source_system: 'wikipedia'})
 OPTIONAL MATCH (kg_node)-[:KG_FROM_CHUNK]->(node)
 OPTIONAL MATCH (kg_node)-[r]-(neighbor)
 WHERE ($year_from IS NULL OR coalesce(entity.time_end_year, entity.time_start_year, 999999) >= $year_from)
@@ -57,6 +61,7 @@ RETURN
   entity.time_start_year AS start_year,
   entity.time_end_year AS end_year,
   doc.wikipedia_url AS wikipedia_url,
+  entity_source.source_url AS provenance_url,
   collect(DISTINCT {
     node: kg_node.name,
     relation: type(r),
@@ -64,6 +69,29 @@ RETURN
   })[0..20] AS graph_neighbors,
   score
 """
+
+TEXT2CYPHER_EXAMPLES = [
+    """Question: Which entities influenced Augustine of Hippo?
+Cypher:
+MATCH (e:Entity {name: "Augustine of Hippo"})-[:INFLUENCED_BY]->(influencer:Entity)
+RETURN influencer.name AS influencer, influencer.wikidata_id AS wikidata_id
+ORDER BY influencer.name""",
+    """Question: Which councils took place in the fourth century?
+Cypher:
+MATCH (e:Entity)
+WHERE e.entity_kind = "Event"
+  AND coalesce(e.time_end_year, e.time_start_year, 999999) >= 300
+  AND coalesce(e.time_start_year, e.time_end_year, -999999) <= 399
+RETURN e.name AS event, e.wikidata_id AS wikidata_id, e.time_start_year AS start_year, e.time_end_year AS end_year
+ORDER BY e.time_start_year, e.name""",
+    """Question: Show source-backed statements about the First Council of Nicaea.
+Cypher:
+MATCH (e:Entity {name: "First Council of Nicaea"})-[:HAS_STATEMENT]->(s:Statement)
+OPTIONAL MATCH (s)-[:TARGETS]->(target:Entity)
+OPTIONAL MATCH (s)-[:SUPPORTED_BY]->(source:SourceDocument)
+RETURN s.relation_type AS relation, target.name AS target, s.rank AS rank, s.reference_count AS reference_count, source.source_url AS source_url
+ORDER BY s.reference_count DESC, relation""",
+]
 
 
 def format_retrieval_record(record) -> RetrieverResultItem:
@@ -77,7 +105,10 @@ def format_retrieval_record(record) -> RetrieverResultItem:
         target = neighbor.get("target")
         target_qid = neighbor.get("target_qid")
         if relation and target:
-            neighbor_lines.append(f"- {relation}: {target} ({target_qid})")
+            if target_qid:
+                neighbor_lines.append(f"- {relation}: {target} ({target_qid})")
+            else:
+                neighbor_lines.append(f"- {relation}: {target}")
 
     content_parts = [
         f"Entity: {data.get('entity_name')} ({data.get('entity_qid')})",
@@ -87,6 +118,7 @@ def format_retrieval_record(record) -> RetrieverResultItem:
         f"Chunk: {data.get('chunk_index')}",
         f"Passage ID: {data.get('passage_id')}",
         f"Source: {data.get('wikipedia_url')}",
+        f"Provenance: {data.get('provenance_url')}",
         f"Score: {data.get('score')}",
         "Passage:",
         data.get("passage") or "",
@@ -101,7 +133,16 @@ def format_retrieval_record(record) -> RetrieverResultItem:
     )
 
 
-def build_rag_response(
+def format_text2cypher_record(record) -> RetrieverResultItem:
+    data = record.data()
+    content = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    return RetrieverResultItem(
+        content=content,
+        metadata=data,
+    )
+
+
+def build_hybrid_rag_response(
     store: Neo4jStore,
     settings: Settings,
     question: str,
@@ -109,18 +150,22 @@ def build_rag_response(
     year_from: Optional[int],
     year_to: Optional[int],
     return_context: bool,
-    index_name: str,
+    vector_index_name: str,
+    fulltext_index_name: str,
     retrieval_query: str,
 ) -> RagResultModel:
-    query_params = {}
-    if year_from is not None:
-        query_params["year_from"] = year_from
-    if year_to is not None:
-        query_params["year_to"] = year_to
+    # HybridCypherRetriever forwards query params to Neo4j exactly as provided.
+    # The retrieval queries reference year_from/year_to even when they are NULL,
+    # so both parameters must always be present.
+    query_params = {
+        "year_from": year_from,
+        "year_to": year_to,
+    }
 
-    retriever = VectorCypherRetriever(
+    retriever = HybridCypherRetriever(
         store.driver,
-        index_name=index_name,
+        vector_index_name=vector_index_name,
+        fulltext_index_name=fulltext_index_name,
         retrieval_query=retrieval_query,
         embedder=build_embedder(settings),
         result_formatter=format_retrieval_record,
@@ -131,8 +176,29 @@ def build_rag_response(
         query_text=question,
         retriever_config={
             "top_k": top_k,
-            "query_params": query_params or None,
+            "query_params": query_params,
         },
+        return_context=return_context,
+    )
+
+
+def build_text2cypher_rag_response(
+    store: Neo4jStore,
+    settings: Settings,
+    question: str,
+    return_context: bool,
+) -> RagResultModel:
+    retriever = Text2CypherRetriever(
+        store.driver,
+        llm=build_llm(settings),
+        neo4j_schema=store.get_graph_schema(),
+        examples=TEXT2CYPHER_EXAMPLES,
+        result_formatter=format_text2cypher_record,
+        neo4j_database=store.database,
+    )
+    rag = GraphRAG(retriever=retriever, llm=build_llm(settings))
+    return rag.search(
+        query_text=question,
         return_context=return_context,
     )
 
@@ -213,7 +279,7 @@ def ask_question(
     year_to: Optional[int] = None,
     return_context: bool = False,
 ) -> RagResultModel:
-    return build_rag_response(
+    return build_hybrid_rag_response(
         store=store,
         settings=settings,
         question=question,
@@ -221,7 +287,8 @@ def ask_question(
         year_from=year_from,
         year_to=year_to,
         return_context=return_context,
-        index_name="passage_embeddings",
+        vector_index_name="passage_embeddings",
+        fulltext_index_name="passage_fulltext",
         retrieval_query=RETRIEVAL_QUERY,
     )
 
@@ -235,7 +302,7 @@ def ask_hybrid_question(
     year_to: Optional[int] = None,
     return_context: bool = False,
 ) -> RagResultModel:
-    return build_rag_response(
+    return build_hybrid_rag_response(
         store=store,
         settings=settings,
         question=question,
@@ -243,6 +310,21 @@ def ask_hybrid_question(
         year_from=year_from,
         year_to=year_to,
         return_context=return_context,
-        index_name="kg_chunk_embeddings",
+        vector_index_name="kg_chunk_embeddings",
+        fulltext_index_name="kg_chunk_fulltext",
         retrieval_query=HYBRID_RETRIEVAL_QUERY,
+    )
+
+
+def ask_cypher_question(
+    store: Neo4jStore,
+    settings: Settings,
+    question: str,
+    return_context: bool = False,
+) -> RagResultModel:
+    return build_text2cypher_rag_response(
+        store=store,
+        settings=settings,
+        question=question,
+        return_context=return_context,
     )
