@@ -45,6 +45,8 @@ class Settings:
     http_backoff_factor: float
     log_level: str
     entity_resolution_similarity_threshold: float
+    entity_resolution_candidate_limit: int
+    entity_resolution_semantic_enabled: bool
     claim_extraction_llm_model: str
     claim_max_per_chunk: int
     community_report_llm_model: str
@@ -52,6 +54,11 @@ class Settings:
     community_report_claim_limit: int
     community_report_relation_limit: int
     router_llm_model: str
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_device: str
+    reranker_batch_size: int
+    reranker_candidate_pool_size: int
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -121,6 +128,14 @@ def load_settings() -> Settings:
         entity_resolution_similarity_threshold=_get_float(
             "ENTITY_RESOLUTION_SIMILARITY_THRESHOLD", 0.9
         ),
+        entity_resolution_candidate_limit=_get_int(
+            "ENTITY_RESOLUTION_CANDIDATE_LIMIT",
+            12,
+        ),
+        entity_resolution_semantic_enabled=_get_bool(
+            "ENTITY_RESOLUTION_SEMANTIC_ENABLED",
+            True,
+        ),
         claim_extraction_llm_model=os.getenv(
             "CLAIM_EXTRACTION_LLM_MODEL",
             os.getenv("KG_BUILDER_LLM_MODEL", os.getenv("LLM_MODEL", "qwen2.5:3b")),
@@ -140,4 +155,12 @@ def load_settings() -> Settings:
             "ROUTER_LLM_MODEL",
             os.getenv("LLM_MODEL", "gemma4:e2b"),
         ),
+        reranker_enabled=_get_bool("RERANKER_ENABLED", True),
+        reranker_model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        reranker_device=os.getenv(
+            "RERANKER_DEVICE",
+            os.getenv("EMBEDDING_DEVICE", "cpu"),
+        ),
+        reranker_batch_size=_get_int("RERANKER_BATCH_SIZE", 8),
+        reranker_candidate_pool_size=_get_int("RERANKER_CANDIDATE_POOL_SIZE", 24),
     )

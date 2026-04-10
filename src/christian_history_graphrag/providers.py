@@ -5,6 +5,7 @@ from neo4j_graphrag.llm.ollama_llm import OllamaLLM
 
 from christian_history_graphrag.config import Settings
 from christian_history_graphrag.local_embeddings import LocalSentenceTransformerEmbedder
+from christian_history_graphrag.reranking import LocalCrossEncoderReranker
 
 
 def build_embedder(settings: Settings):
@@ -41,4 +42,14 @@ def build_llm(settings: Settings, model_name: str | None = None) -> OllamaLLM:
                 "num_ctx": settings.llm_num_ctx,
             }
         },
+    )
+
+
+def build_reranker(settings: Settings):
+    if not settings.reranker_enabled or not settings.reranker_model.strip():
+        return None
+    return LocalCrossEncoderReranker(
+        model_name=settings.reranker_model,
+        device=settings.reranker_device,
+        batch_size=settings.reranker_batch_size,
     )

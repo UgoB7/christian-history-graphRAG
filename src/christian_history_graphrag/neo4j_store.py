@@ -279,6 +279,10 @@ class Neo4jStore:
                         p.language = $language,
                         p.chunk_index = $chunk_index,
                         p.text = $text,
+                        p.section_title = $section_title,
+                        p.section_path = $section_path,
+                        p.section_path_text = $section_path_text,
+                        p.outgoing_links = $outgoing_links,
                         p.source = 'wikipedia',
                         p.source_system = $source_system,
                         p.source_document_id = $source_document_id,
@@ -294,12 +298,16 @@ class Neo4jStore:
                     """,
                     {
                         "wikidata_id": record.qid,
-                        "passage_id": f"wikipedia:{record.qid}:{passage.chunk_index}",
+                        "passage_id": passage.passage_id or f"wikipedia:{record.qid}:{passage.chunk_index}",
                         "title": passage.page_title,
                         "url": passage.url,
                         "language": passage.language,
                         "chunk_index": passage.chunk_index,
                         "text": passage.text,
+                        "section_title": passage.section_title,
+                        "section_path": passage.section_path,
+                        "section_path_text": " > ".join(passage.section_path),
+                        "outgoing_links": passage.outgoing_links,
                         "source_system": passage.source_system,
                         "source_document_id": passage.source_document_id,
                         "retrieved_at": passage.retrieved_at,
@@ -378,7 +386,7 @@ class Neo4jStore:
             self.driver,
             "passage_fulltext",
             label="Passage",
-            node_properties=["title", "text"],
+            node_properties=["title", "section_title", "section_path_text", "text"],
             neo4j_database=self.database,
         )
 
@@ -1054,7 +1062,10 @@ class Neo4jStore:
                    e.name AS name,
                    coalesce(e.aliases, []) AS aliases,
                    e.wikipedia_title AS wikipedia_title,
-                   e.entity_kind AS entity_kind
+                   e.wikipedia_url AS wikipedia_url,
+                   e.entity_kind AS entity_kind,
+                   e.time_start_year AS time_start_year,
+                   e.time_end_year AS time_end_year
             """,
             database_=self.database,
         )
@@ -1064,6 +1075,8 @@ class Neo4jStore:
         result = self.driver.execute_query(
             """
             MATCH (n)-[:KG_FROM_CHUNK]->(:KgChunk)
+            OPTIONAL MATCH (n)-[:KG_FROM_CHUNK]->(:KgChunk)-[:KG_FROM_DOCUMENT]->(doc:KgDocument)
+            OPTIONAL MATCH (root:Entity)-[:HAS_KG_DOCUMENT]->(doc)
             WHERE NOT n:Entity
               AND NOT n:Passage
               AND NOT n:KgDocument
@@ -1071,7 +1084,14 @@ class Neo4jStore:
               AND n.name IS NOT NULL
             RETURN elementId(n) AS element_id,
                    labels(n) AS labels,
-                   n.name AS name
+                   n.name AS name,
+                   doc.wikipedia_title AS document_title,
+                   doc.wikipedia_url AS document_url,
+                   root.wikidata_id AS source_entity_qid,
+                   root.name AS source_entity_name,
+                   root.entity_kind AS source_entity_kind,
+                   root.time_start_year AS source_time_start_year,
+                   root.time_end_year AS source_time_end_year
             """,
             database_=self.database,
         )
@@ -1094,6 +1114,10 @@ class Neo4jStore:
         method: str,
         score: float,
         matched_text: str,
+        alias_score: Optional[float] = None,
+        embedding_score: Optional[float] = None,
+        type_score: Optional[float] = None,
+        context_score: Optional[float] = None,
     ) -> None:
         self.driver.execute_query(
             """
@@ -1102,7 +1126,11 @@ class Neo4jStore:
             MERGE (n)-[r:RESOLVES_TO]->(e)
             SET r.method = $method,
                 r.score = $score,
-                r.matched_text = $matched_text
+                r.matched_text = $matched_text,
+                r.alias_score = $alias_score,
+                r.embedding_score = $embedding_score,
+                r.type_score = $type_score,
+                r.context_score = $context_score
             """,
             {
                 "node_element_id": node_element_id,
@@ -1110,6 +1138,10 @@ class Neo4jStore:
                 "method": method,
                 "score": score,
                 "matched_text": matched_text,
+                "alias_score": alias_score,
+                "embedding_score": embedding_score,
+                "type_score": type_score,
+                "context_score": context_score,
             },
             database_=self.database,
         )

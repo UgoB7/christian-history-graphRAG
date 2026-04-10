@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Optional
+import logging
+from typing import Any, Callable, Optional
 
 from neo4j_graphrag.generation import GraphRAG
 from neo4j_graphrag.generation.types import RagResultModel
@@ -11,7 +12,10 @@ from neo4j_graphrag.types import EntityType, RetrieverResultItem
 
 from christian_history_graphrag.config import Settings
 from christian_history_graphrag.neo4j_store import Neo4jStore
-from christian_history_graphrag.providers import build_embedder, build_llm
+from christian_history_graphrag.providers import build_embedder, build_llm, build_reranker
+
+
+logger = logging.getLogger(__name__)
 
 
 RETRIEVAL_QUERY = """
@@ -24,6 +28,8 @@ RETURN
   coalesce(node.id, elementId(node)) AS passage_id,
   node.text AS passage,
   node.title AS page_title,
+  node.section_title AS section_title,
+  coalesce(node.section_path, []) AS section_path,
   node.chunk_index AS chunk_index,
   entity.name AS entity_name,
   entity.wikidata_id AS entity_qid,
@@ -54,6 +60,8 @@ RETURN
   coalesce(node.id, elementId(node)) AS passage_id,
   node.text AS passage,
   doc.wikipedia_title AS page_title,
+  NULL AS section_title,
+  [] AS section_path,
   node.index AS chunk_index,
   entity.name AS entity_name,
   entity.wikidata_id AS entity_qid,
@@ -82,6 +90,8 @@ RETURN
   node.claim_id AS passage_id,
   node.claim_text AS passage,
   doc.wikipedia_title AS page_title,
+  NULL AS section_title,
+  [] AS section_path,
   node.chunk_index AS chunk_index,
   entity.name AS entity_name,
   entity.wikidata_id AS entity_qid,
@@ -115,6 +125,8 @@ RETURN
   node.report_id AS passage_id,
   node.report_text AS passage,
   node.title AS page_title,
+  NULL AS section_title,
+  [] AS section_path,
   0 AS chunk_index,
   coalesce(entity.name, node.focus_entity_name) AS entity_name,
   coalesce(entity.wikidata_id, node.focus_entity_qid) AS entity_qid,
@@ -159,9 +171,137 @@ ORDER BY s.reference_count DESC, relation""",
 ]
 
 
+def _format_score(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_reranker_text(item: RetrieverResultItem) -> str:
+    metadata = dict(item.metadata or {})
+    passage_text = metadata.get("passage") or metadata.get("report_summary") or item.content
+    section_path = metadata.get("section_path") or []
+    section_text = " > ".join(str(part) for part in section_path if part)
+
+    parts = [
+        f"Entity: {metadata.get('entity_name')}",
+        f"Type: {metadata.get('entity_kind')}",
+        f"Page: {metadata.get('page_title')}",
+        f"Section: {metadata.get('section_title')}",
+        f"Section path: {section_text or None}",
+        f"Passage: {passage_text}",
+    ]
+    return "\n".join(str(part) for part in parts if part is not None)
+
+
+def _replace_retriever_result(result, *, items, metadata):
+    if hasattr(result, "model_copy"):
+        return result.model_copy(update={"items": items, "metadata": metadata})
+    if hasattr(result, "copy"):
+        try:
+            return result.copy(update={"items": items, "metadata": metadata})
+        except TypeError:
+            pass
+
+    try:
+        result.items = items
+    except Exception:
+        pass
+    try:
+        result.metadata = metadata
+    except Exception:
+        pass
+    return result
+
+
+def _replace_result_item_metadata(item: RetrieverResultItem, metadata: dict[str, Any]) -> RetrieverResultItem:
+    updated_content = item.content
+    rerank_score = metadata.get("rerank_score")
+    if rerank_score is not None and "Rerank score:" not in updated_content:
+        updated_content = f"{updated_content}\nRerank score: {_format_score(rerank_score)}"
+
+    if hasattr(item, "model_copy"):
+        return item.model_copy(update={"metadata": metadata, "content": updated_content})
+    if hasattr(item, "copy"):
+        try:
+            return item.copy(update={"metadata": metadata, "content": updated_content})
+        except TypeError:
+            pass
+
+    try:
+        item.metadata = metadata
+    except Exception:
+        pass
+    try:
+        item.content = updated_content
+    except Exception:
+        pass
+    return item
+
+
+class RerankingRetriever:
+    def __init__(self, inner_retriever, reranker, *, candidate_pool_size: int) -> None:
+        self.inner_retriever = inner_retriever
+        self.reranker = reranker
+        self.candidate_pool_size = max(candidate_pool_size, 1)
+
+    def __getattr__(self, name):
+        return getattr(self.inner_retriever, name)
+
+    def search(self, *args, **kwargs):
+        query_text = kwargs.get("query_text")
+        if query_text is None and args:
+            query_text = args[0]
+
+        requested_top_k = kwargs.get("top_k", 5)
+        try:
+            requested_top_k = max(int(requested_top_k), 1)
+        except (TypeError, ValueError):
+            requested_top_k = 5
+
+        inner_kwargs = dict(kwargs)
+        inner_kwargs["top_k"] = max(requested_top_k, self.candidate_pool_size)
+        result = self.inner_retriever.search(*args, **inner_kwargs)
+        items = list(getattr(result, "items", []) or [])
+        if not items or not query_text:
+            return result
+
+        try:
+            reranker_texts = [_build_reranker_text(item) for item in items]
+            rerank_scores = self.reranker.score(query_text, reranker_texts)
+            reranked_pairs = sorted(
+                zip(rerank_scores, items),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+        except Exception as exc:
+            logger.warning("Reranking failed; falling back to retrieval order: %s", exc)
+            return result
+
+        reranked_items = []
+        for score, item in reranked_pairs[:requested_top_k]:
+            metadata = dict(item.metadata or {})
+            metadata["rerank_score"] = float(score)
+            reranked_items.append(_replace_result_item_metadata(item, metadata))
+
+        result_metadata = dict(getattr(result, "metadata", {}) or {})
+        result_metadata["reranked"] = True
+        result_metadata["reranker_model"] = getattr(self.reranker, "model_name", None)
+        result_metadata["reranker_candidate_pool_size"] = len(items)
+        return _replace_retriever_result(
+            result,
+            items=reranked_items,
+            metadata=result_metadata,
+        )
+
+
 def format_retrieval_record(record) -> RetrieverResultItem:
     data = record.data()
     neighbors = data.get("graph_neighbors") or []
+    section_path = data.get("section_path") or []
     neighbor_lines = []
     for neighbor in neighbors:
         if not neighbor:
@@ -180,11 +320,14 @@ def format_retrieval_record(record) -> RetrieverResultItem:
         f"Type: {data.get('entity_kind')}",
         f"Period: {data.get('start_year')} -> {data.get('end_year')}",
         f"Page: {data.get('page_title')}",
+        f"Section: {data.get('section_title')}",
+        "Section path: " + " > ".join(str(item) for item in section_path) if section_path else None,
         f"Chunk: {data.get('chunk_index')}",
         f"Passage ID: {data.get('passage_id')}",
         f"Source: {data.get('wikipedia_url')}",
         f"Provenance: {data.get('provenance_url')}",
-        f"Score: {data.get('score')}",
+        f"Score: {_format_score(data.get('score'))}",
+        f"Rerank score: {_format_score(data.get('rerank_score'))}" if data.get("rerank_score") is not None else None,
         "Passage:",
         data.get("passage") or "",
     ]
@@ -223,7 +366,8 @@ def format_claim_record(record) -> RetrieverResultItem:
         f"Source: {data.get('wikipedia_url')}",
         f"Provenance: {data.get('provenance_url')}",
         f"Claim confidence: {data.get('claim_confidence')}",
-        f"Score: {data.get('score')}",
+        f"Score: {_format_score(data.get('score'))}",
+        f"Rerank score: {_format_score(data.get('rerank_score'))}" if data.get("rerank_score") is not None else None,
         "Claim:",
         data.get("passage") or "",
         f"Evidence quote: {data.get('provenance_quote')}",
@@ -260,7 +404,8 @@ def format_community_report_record(record) -> RetrieverResultItem:
         f"Period: {data.get('start_year')} -> {data.get('end_year')}",
         f"Report ID: {data.get('passage_id')}",
         f"Source: {data.get('wikipedia_url')}",
-        f"Score: {data.get('score')}",
+        f"Score: {_format_score(data.get('score'))}",
+        f"Rerank score: {_format_score(data.get('rerank_score'))}" if data.get("rerank_score") is not None else None,
         "Summary:",
         data.get("report_summary") or data.get("passage") or "",
     ]
@@ -318,6 +463,17 @@ def build_hybrid_rag_response(
         result_formatter=result_formatter,
         neo4j_database=store.database,
     )
+    try:
+        reranker = build_reranker(settings)
+    except Exception as exc:
+        logger.warning("Reranker unavailable; using base retrieval order: %s", exc)
+        reranker = None
+    if reranker is not None:
+        retriever = RerankingRetriever(
+            retriever,
+            reranker,
+            candidate_pool_size=settings.reranker_candidate_pool_size,
+        )
     rag = GraphRAG(retriever=retriever, llm=build_llm(settings))
     return rag.search(
         query_text=question,

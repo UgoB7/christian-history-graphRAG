@@ -41,6 +41,9 @@ class WikipediaPassage:
     language: str
     chunk_index: int
     text: str
+    section_title: Optional[str] = None
+    section_path: list[str] = field(default_factory=list)
+    outgoing_links: list[str] = field(default_factory=list)
     source_document_id: Optional[str] = None
     source_system: str = "wikipedia"
     retrieved_at: Optional[str] = None
@@ -145,6 +148,9 @@ def entity_record_from_dict(payload: dict[str, Any]) -> EntityRecord:
                 language=passage["language"],
                 chunk_index=passage["chunk_index"],
                 text=passage["text"],
+                section_title=passage.get("section_title"),
+                section_path=list(passage.get("section_path", [])),
+                outgoing_links=list(passage.get("outgoing_links", [])),
                 source_document_id=passage.get("source_document_id"),
                 source_system=passage.get("source_system", "wikipedia"),
                 retrieved_at=passage.get("retrieved_at"),

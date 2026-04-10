@@ -9,7 +9,11 @@ from neo4j_graphrag.indexes import upsert_vectors
 from neo4j_graphrag.types import EntityType
 
 from christian_history_graphrag.config import Settings
-from christian_history_graphrag.entity_resolution import build_alias_index, match_entity_name
+from christian_history_graphrag.entity_resolution import (
+    EntityResolutionResources,
+    build_entity_resolution_resources,
+    match_entity_name,
+)
 from christian_history_graphrag.llm_json import extract_json_payload
 from christian_history_graphrag.models import ClaimRecord
 from christian_history_graphrag.neo4j_store import Neo4jStore
@@ -107,17 +111,17 @@ def _build_claim_id(root_entity_qid: str, chunk_id: str, claim_text: str) -> str
 def _resolve_claim_entity_name(
     value: Optional[str],
     *,
-    alias_index: dict[str, list[dict]],
-    alias_rows: list[tuple[str, str, dict]],
+    resources: EntityResolutionResources,
     threshold: float,
+    candidate_limit: int,
 ) -> Optional[str]:
     if not value:
         return None
     match = match_entity_name(
         value,
-        alias_index=alias_index,
-        alias_rows=alias_rows,
+        resources=resources,
         threshold=threshold,
+        candidate_limit=candidate_limit,
     )
     if not match:
         return None
@@ -149,7 +153,11 @@ def extract_claims(
     store.ensure_claim_indexes()
     llm = build_llm(settings, model_name=settings.claim_extraction_llm_model)
     entity_index = store.list_entities_for_resolution()
-    alias_index, alias_rows = build_alias_index(entity_index)
+    resolution_resources = build_entity_resolution_resources(
+        entity_index,
+        settings=settings,
+        reporter=reporter,
+    )
 
     processed_entities = 0
     created_claims = 0
@@ -216,15 +224,15 @@ def extract_claims(
                         root_entity_name=entity["name"],
                         subject_entity_qid=_resolve_claim_entity_name(
                             subject,
-                            alias_index=alias_index,
-                            alias_rows=alias_rows,
+                            resources=resolution_resources,
                             threshold=settings.entity_resolution_similarity_threshold,
+                            candidate_limit=settings.entity_resolution_candidate_limit,
                         ),
                         object_entity_qid=_resolve_claim_entity_name(
                             object_value,
-                            alias_index=alias_index,
-                            alias_rows=alias_rows,
+                            resources=resolution_resources,
                             threshold=settings.entity_resolution_similarity_threshold,
+                            candidate_limit=settings.entity_resolution_candidate_limit,
                         ),
                         extracted_at=_utcnow_iso(),
                         extraction_model=settings.claim_extraction_llm_model,
