@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Callable, Optional
 
+from neo4j_graphrag.exceptions import LLMGenerationError
 from neo4j_graphrag.experimental.components.text_splitters.fixed_size_splitter import (
     FixedSizeSplitter,
 )
@@ -130,7 +131,7 @@ async def enrich_entities_with_kg_builder(
     if not candidates:
         return 0
 
-    llm = build_llm(settings)
+    llm = build_llm(settings, model_name=settings.kg_builder_llm_model)
     embedder = build_embedder(settings)
     splitter = FixedSizeSplitter(
         chunk_size=settings.kg_builder_chunk_size,
@@ -194,11 +195,24 @@ async def enrich_entities_with_kg_builder(
         tracker = KGBuilderLogTracker()
         extractor_logger.addHandler(tracker)
         try:
-            await pipeline.run_async(
-                file_path=entity["wikipedia_url"],
-                text=article_text,
-                document_metadata=document_metadata,
-            )
+            try:
+                await pipeline.run_async(
+                    file_path=entity["wikipedia_url"],
+                    text=article_text,
+                    document_metadata=document_metadata,
+                )
+            except LLMGenerationError as exc:
+                message = str(exc)
+                if "model failed to load" in message and reporter:
+                    reporter(
+                        "  Ollama n'a pas pu charger le modele du KG Builder. "
+                        f"Modele configure: {settings.kg_builder_llm_model}"
+                    )
+                    reporter(
+                        "  Conseil: utilise un modele plus leger pour "
+                        "KG_BUILDER_LLM_MODEL, par ex. qwen2.5:3b."
+                    )
+                raise
         finally:
             extractor_logger.removeHandler(tracker)
 

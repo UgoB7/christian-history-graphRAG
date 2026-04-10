@@ -17,6 +17,7 @@ class Settings:
     neo4j_database: str
     llm_provider: str
     llm_model: str
+    kg_builder_llm_model: str
     llm_base_url: str
     llm_temperature: float
     llm_num_ctx: int
@@ -66,7 +67,11 @@ def load_settings() -> Settings:
         neo4j_password=os.getenv("NEO4J_PASSWORD", "please-change-me"),
         neo4j_database=os.getenv("NEO4J_DATABASE", "neo4j"),
         llm_provider=os.getenv("LLM_PROVIDER", "ollama"),
-        llm_model=os.getenv("LLM_MODEL", "qwen3:8b"),
+        llm_model=os.getenv("LLM_MODEL", "gemma4:e2b"),
+        kg_builder_llm_model=os.getenv(
+            "KG_BUILDER_LLM_MODEL",
+            os.getenv("LLM_MODEL", "qwen2.5:3b"),
+        ),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434"),
         llm_temperature=_get_float("LLM_TEMPERATURE", 0.2),
         llm_num_ctx=_get_int("LLM_NUM_CTX", 8192),

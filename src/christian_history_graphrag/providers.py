@@ -27,13 +27,13 @@ def build_embedder(settings: Settings):
     )
 
 
-def build_llm(settings: Settings) -> OllamaLLM:
+def build_llm(settings: Settings, model_name: str | None = None) -> OllamaLLM:
     provider = settings.llm_provider.lower()
     if provider != "ollama":
         raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
 
     return OllamaLLM(
-        model_name=settings.llm_model,
+        model_name=model_name or settings.llm_model,
         host=settings.llm_base_url,
         model_params={
             "options": {

@@ -81,7 +81,7 @@ Le code attend un serveur Ollama sur `http://localhost:11434` par défaut.
 Ensuite récupère un modèle:
 
 ```bash
-ollama pull qwen3:8b
+ollama pull gemma4:e2b
 ```
 
 ### 4. Configurer le projet
@@ -93,11 +93,17 @@ cp .env.example .env
 Variables importantes:
 
 - `LLM_PROVIDER=ollama`
-- `LLM_MODEL=qwen3:8b`
+- `LLM_MODEL=gemma4:e2b`
+- `KG_BUILDER_LLM_MODEL=qwen2.5:3b`
 - `LLM_BASE_URL=http://localhost:11434`
 - `EMBEDDING_PROVIDER=sentence-transformers`
 - `EMBEDDING_MODEL=BAAI/bge-m3`
 - `EMBEDDING_DEVICE=cpu` ou `cuda`
+
+Recommandation pratique sur Mac:
+
+- `LLM_MODEL=gemma4:e2b` pour les reponses si Ollama arrive a le charger
+- `KG_BUILDER_LLM_MODEL=qwen2.5:3b` pour `kg-enrich`, plus stable et leger
 
 ## Repartir de zéro
 
